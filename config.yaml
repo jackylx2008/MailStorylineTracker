@@ -1,0 +1,36 @@
+app:
+  log_level: ${LOG_LEVEL:-INFO}
+  data_dir: ${MAIL_DATA_DIR:-./data}
+  output_dir: ${OUTPUT_DIR:-./output}
+
+mail:
+  imap:
+    host: ${MAIL_IMAP_HOST:-imap.126.com}
+    port: ${MAIL_IMAP_PORT:-993}
+    user: ${MAIL_IMAP_USER:-}
+    password: ${MAIL_IMAP_PASSWORD:-}
+    support_email: ${MAIL_IMAP_SUPPORT_EMAIL:-support@example.invalid}
+    client_id:
+      name: MailStorylineTracker
+      version: "1.0"
+      vendor: local-python
+  folders: ${MAIL_FOLDERS_JSON:-["INBOX"]}
+  since: ${MAIL_SINCE:-2024-01-01}
+  before: ${MAIL_BEFORE:-}
+  max_messages_per_folder: ${MAIL_MAX_MESSAGES_PER_FOLDER:-500}
+  filters:
+    senders: ${MAIL_FILTER_SENDERS_JSON:-[]}
+    recipients: ${MAIL_FILTER_RECIPIENTS_JSON:-[]}
+    keywords: ${MAIL_FILTER_KEYWORDS_JSON:-[]}
+    match_mode: ${MAIL_FILTER_MATCH_MODE:-any}
+
+ai:
+  base_url: ${AI_BASE_URL:-http://127.0.0.1:8080/v1}
+  model: ${AI_MODEL:-local-model}
+  api_key: ${AI_API_KEY:-}
+  remote_enabled: ${AI_REMOTE_ENABLED:-false}
+  timeout_seconds: ${AI_TIMEOUT_SECONDS:-300}
+  max_tokens: ${AI_MAX_TOKENS:-4096}
+  temperature: ${AI_TEMPERATURE:-0}
+  max_input_chars: ${AI_MAX_INPUT_CHARS:-60000}
+  max_body_chars_per_message: ${AI_MAX_BODY_CHARS_PER_MESSAGE:-6000}

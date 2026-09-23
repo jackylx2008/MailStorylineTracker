@@ -1,0 +1,15 @@
+.venv/
+.conda/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.env
+common.env
+logs/
+data/
+output/
+vendor/
+.vscode/
+.idea/
+*.local.json
