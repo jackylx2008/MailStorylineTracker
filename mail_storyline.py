@@ -32,12 +32,12 @@ if str(SRC) not in sys.path:
 
 from logging_config import configure_utf8_stdio, setup_logger
 from mail_storyline_tracker.config import bootstrap
-from mail_storyline_tracker.flows.mail_flow import analyze, check_ai, check_connection, download, list_folders, preview
+from mail_storyline_tracker.flows.mail_flow import analyze, check_ai, check_connection, check_login, download, list_folders, preview
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("action", choices=("check-mail", "list-folders", "preview", "download", "check-ai", "analyze", "all"))
+    parser.add_argument("action", choices=("check-login", "check-mail", "list-folders", "preview", "download", "check-ai", "analyze", "all"))
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--folders", help="逗号分隔的邮箱文件夹")
     parser.add_argument("--senders", help="逗号分隔的发件人地址或片段")
@@ -55,7 +55,9 @@ def main() -> int:
     ctx = bootstrap(PROJECT_ROOT, args.config)
     setup_logger(ctx.config.get("app", {}).get("log_level", "INFO"))
     overrides = {key: value for key, value in vars(args).items() if key in {"folders", "senders", "recipients", "keywords", "match_mode", "since", "before"} and value is not None}
-    if args.action == "check-mail":
+    if args.action == "check-login":
+        result = check_login(ctx)
+    elif args.action == "check-mail":
         result = check_connection(ctx, overrides)
     elif args.action == "list-folders":
         result = {"folders": list_folders(ctx)}

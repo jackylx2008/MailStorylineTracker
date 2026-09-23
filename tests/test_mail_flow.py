@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mail_storyline_tracker.config import AppContext
-from mail_storyline_tracker.flows.mail_flow import download
+from mail_storyline_tracker.flows.mail_flow import check_login, download
 
 
 def _message(sender: str, subject: str, body: str, message_id: str) -> bytes:
@@ -47,6 +47,22 @@ class FakeImapClient:
 
 
 class MailFlowTests(unittest.TestCase):
+    def test_login_check_does_not_select_or_fetch_mail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = {
+                "app": {"data_dir": "data", "output_dir": "output"},
+                "mail": {
+                    "imap": {"host": "imap.126.com", "port": 993, "user": "demo@126.com", "password": "secret"},
+                    "folders": ["INBOX"],
+                    "filters": {"match_mode": "any"},
+                },
+            }
+            with patch("mail_storyline_tracker.flows.mail_flow.Imap126Client", FakeImapClient):
+                result = check_login(AppContext(root, config))
+            self.assertEqual(result["status"], "ok")
+            self.assertFalse(result["mail_accessed"])
+
     def test_download_archives_matches_and_skips_processed_uids(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -20,6 +20,14 @@ logger = logging.getLogger(__name__)
 Progress = Callable[[str, int, int], None]
 
 
+def check_login(ctx: AppContext) -> dict[str, Any]:
+    """只验证 TLS、LOGIN 与 126 ID 握手，不列出或选择邮箱文件夹。"""
+    settings = MailSettings.from_config(ctx.config)
+    with Imap126Client(settings):
+        pass
+    return {"status": "ok", "account": _mask(settings.user), "mail_accessed": False}
+
+
 def check_connection(ctx: AppContext, overrides: Mapping[str, Any] | None = None) -> dict[str, Any]:
     settings = MailSettings.from_config(ctx.config).with_overrides(overrides)
     with Imap126Client(settings) as client:

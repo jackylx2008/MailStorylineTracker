@@ -80,6 +80,7 @@ AI_REMOTE_ENABLED=false
 命令行检查与运行：
 
 ```powershell
+python mail_storyline.py check-login
 python mail_storyline.py check-mail
 python mail_storyline.py list-folders
 python mail_storyline.py preview --senders example.com --keywords 项目,验收 --match-mode any
@@ -88,6 +89,20 @@ python mail_storyline.py check-ai
 python mail_storyline.py analyze
 python mail_storyline.py all
 ```
+
+其中 `check-login` 只建立 TLS 连接、提交账号授权码并完成 126 客户端 `ID` 握手，随后立即登出。它不会列出或选择文件夹，也不会搜索、读取或下载邮件。`check-mail` 会在登录后列出服务器文件夹，但同样不会读取邮件正文。
+
+### 126 登录排错
+
+若服务器返回 `LOGIN Login error or password error`：
+
+1. 确认填写的是 126 的客户端授权码，不是网页登录密码。
+2. 确认邮箱设置中已启用 IMAP/SMTP 服务。
+3. 确认授权码属于 `MAIL_IMAP_USER` 指定的同一账号。
+4. 确认 `.env` 或 `common.env` 中没有重复的 `MAIL_IMAP_USER`、`MAIL_IMAP_PASSWORD`。
+5. 修改配置后重新启动命令，不要把真实账号或授权码复制到日志、问题单或 Git。
+
+详细配置与安全验证步骤见 [docs/MAIL_CONFIGURATION.md](docs/MAIL_CONFIGURATION.md)。
 
 ## 输出目录
 
@@ -136,10 +151,10 @@ git diff --check
 
 ## Git 同步
 
-仓库使用 `main` 分支。真实 `.env`、邮件、附件、输出、日志和本地虚拟环境已在 `.gitignore` 中排除。添加远端后推荐使用 SSH：
+仓库使用 `main` 分支，远端为 `git@github.com:jackylx2008/MailStorylineTracker.git`。真实 `.env`、`common.env`、邮件、附件、输出、日志和本地虚拟环境已在 `.gitignore` 中排除。推荐使用 SSH：
 
 ```powershell
-git remote add origin git@github.com:<owner>/<repo>.git
+git remote add origin git@github.com:jackylx2008/MailStorylineTracker.git
 git status -sb
 git add -A
 git commit -m "Implement initial mail storyline tracker"
