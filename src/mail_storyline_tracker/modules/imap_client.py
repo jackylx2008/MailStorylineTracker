@@ -4,6 +4,7 @@ import base64
 import imaplib
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from .mail_settings import MailSettings
@@ -31,6 +32,8 @@ class Imap126Client:
         self._client: imaplib.IMAP4_SSL | None = None
         self.selected_mailbox = ""
         self.uidvalidity = ""
+        self._last_fetch_at = 0.0
+        self._fetch_count = 0
 
     def __enter__(self) -> "Imap126Client":
         self.settings.validate_connection()
@@ -149,7 +152,7 @@ class Imap126Client:
         return [item.decode("ascii") for item in raw.split()]
 
     def fetch_message(self, uid: str) -> bytes:
-        status, payload = self._require().uid("fetch", uid, "(RFC822)")
+        status, payload = self._fetch(uid, "(RFC822)")
         if status != "OK":
             if _is_fetch_volume_limit(payload):
                 raise FetchVolumeLimitError("126 IMAP FETCH 下载流量已达到阶段性上限")
@@ -161,7 +164,7 @@ class Imap126Client:
 
     def fetch_message_preview(self, uid: str, max_bytes: int = 128 * 1024) -> bytes:
         """只读取邮件开头片段，用于地址、关键词和附件名筛选，避免下载大附件正文。"""
-        status, payload = self._require().uid("fetch", uid, f"(BODY.PEEK[]<0.{max_bytes}>)")
+        status, payload = self._fetch(uid, f"(BODY.PEEK[]<0.{max_bytes}>)")
         if status != "OK":
             if _is_fetch_volume_limit(payload):
                 raise FetchVolumeLimitError("126 IMAP FETCH 下载流量已达到阶段性上限")
@@ -170,6 +173,29 @@ class Imap126Client:
             if isinstance(item, tuple) and len(item) >= 2 and isinstance(item[1], bytes):
                 return item[1]
         raise RuntimeError(f"服务器未返回邮件预览：folder={self.selected_mailbox} uid={uid}")
+
+    def _fetch(self, uid: str, query: str) -> tuple[str, list[object]]:
+        self._pace_fetch()
+        try:
+            return self._require().uid("fetch", uid, query)
+        finally:
+            self._fetch_count += 1
+            self._last_fetch_at = time.monotonic()
+
+    def _pace_fetch(self) -> None:
+        if self._fetch_count and self._fetch_count % self.settings.fetch_batch_size == 0:
+            logger.info(
+                "126 FETCH 保守批次暂停：已请求 %s 次，暂停 %.1f 秒",
+                self._fetch_count,
+                self.settings.fetch_batch_pause_seconds,
+            )
+            time.sleep(self.settings.fetch_batch_pause_seconds)
+        if not self._last_fetch_at:
+            return
+        elapsed = time.monotonic() - self._last_fetch_at
+        remaining = self.settings.fetch_interval_seconds - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
 
     def _send_client_id(self) -> None:
         client = self._require()
@@ -241,6 +267,15 @@ def _is_fetch_volume_limit(payload: object) -> bool:
     if isinstance(payload, bytes):
         return b"fetch volume limit exceed" in payload.lower()
     return "fetch volume limit exceed" in str(payload).lower()
+
+
+def is_imap_connection_error(exc: BaseException) -> bool:
+    """识别不宜继续请求的短暂连接故障。
+
+    不在同一次运行中自动重发 FETCH，避免服务器已传输但客户端未收到完整
+    响应时重复计入流量。下次运行会从最近的持久化检查点继续。
+    """
+    return isinstance(exc, (imaplib.IMAP4.abort, ConnectionError, TimeoutError, EOFError, OSError))
 
 
 def _mask_email(value: str) -> str:

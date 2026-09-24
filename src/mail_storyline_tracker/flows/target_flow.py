@@ -9,7 +9,7 @@ from typing import Any
 from ..config import AppContext
 from ..modules.ai_client import AISettings, OpenAICompatibleClient
 from ..modules.html_report import write_target_mindmap
-from ..modules.imap_client import FetchVolumeLimitError, Imap126Client
+from ..modules.imap_client import FetchVolumeLimitError, Imap126Client, is_imap_connection_error
 from ..modules.mail_parser import parse_message
 from ..modules.mail_settings import MailSettings
 from ..modules.storage import ArchiveStore
@@ -31,31 +31,56 @@ def scan_targets(
     criteria = criteria or TargetCriteria.load(ctx.project_root)
     settings = MailSettings.from_config(ctx.config)
     ai = OpenAICompatibleClient(AISettings.from_config(ctx.config))
-    ai.check()
     store = ArchiveStore(ctx.data_dir)
+    blocked_until = store.fetch_blocked_until(settings.user)
+    if blocked_until:
+        reason = f"126 官方建议流量超限后间隔 24 小时再试；本地保护暂停至 {blocked_until}"
+        logger.warning(reason)
+        return generate_target_report(
+            ctx,
+            criteria,
+            {"incomplete": True, "stop_reason": reason, "errors": [{"mailbox": "", "uid": "", "error": reason}]},
+        )
+    ai.check()
     batch: list[tuple[str, bytes, dict[str, Any]]] = []
     skipped = 0
     checked = 0
     saved = 0
     volume_limited = False
+    interrupted = False
+    budget_reached = False
+    stop_reason = ""
     errors: list[dict[str, str]] = []
 
     with Imap126Client(settings) as client:
         mailboxes = [item for item in client.list_mailboxes() if not _has_noselect(item.flags)]
         total_folders = len(mailboxes)
         for folder_index, mailbox in enumerate(mailboxes, start=1):
+            if checked >= settings.max_messages_per_run:
+                budget_reached = True
+                break
             try:
                 _count, uidvalidity = client.select_mailbox(mailbox.name)
-                uids = client.search_uids(settings.since, settings.before, settings.max_messages_per_folder)
+                uids = client.search_uids(settings.since, settings.before, 0)
             except Exception as exc:
                 logger.exception("无法扫描邮箱文件夹：%s", mailbox.name)
                 errors.append({"mailbox": mailbox.name, "uid": "", "error": f"{type(exc).__name__}: {exc}"})
+                if is_imap_connection_error(exc):
+                    interrupted = True
+                    break
                 continue
+            folder_checked = 0
             for message_index, uid in enumerate(uids, start=1):
                 key = store.state_key(settings.user, mailbox.name, uidvalidity, uid)
                 if store.is_processed(key, criteria.signature):
                     skipped += 1
                     continue
+                if checked >= settings.max_messages_per_run:
+                    budget_reached = True
+                    break
+                if folder_checked >= settings.max_messages_per_folder:
+                    break
+                folder_checked += 1
                 if progress:
                     progress(f"{mailbox.name} UID {uid}", message_index, len(uids))
                 try:
@@ -87,20 +112,34 @@ def scan_targets(
                         )
                 except FetchVolumeLimitError as exc:
                     volume_limited = True
+                    blocked_until = store.mark_fetch_limited(settings.user, settings.volume_limit_cooldown_hours)
                     logger.warning("目标扫描因 126 下载流量限制暂停：folder=%s uid=%s", mailbox.name, uid)
-                    errors.append({"mailbox": mailbox.name, "uid": uid, "error": str(exc)})
+                    errors.append({
+                        "mailbox": mailbox.name,
+                        "uid": uid,
+                        "error": f"{exc}；本地保护暂停至 {blocked_until}",
+                    })
                     break
                 except Exception as exc:
                     logger.exception("邮件处理失败：folder=%s uid=%s", mailbox.name, uid)
                     errors.append({"mailbox": mailbox.name, "uid": uid, "error": f"{type(exc).__name__}: {exc}"})
+                    if is_imap_connection_error(exc):
+                        interrupted = True
+                        break
             if batch:
                 saved += _process_batch(batch, store, criteria, ai)
                 batch.clear()
             logger.info("目标扫描进度：文件夹 %s/%s %s", folder_index, total_folders, mailbox.name)
-            if volume_limited:
+            if volume_limited or interrupted or budget_reached:
                 break
 
     store.flush()
+    if volume_limited:
+        stop_reason = f"126 IMAP FETCH 下载流量已达到阶段性上限；依据官方建议暂停至 {blocked_until}"
+    elif interrupted:
+        stop_reason = "IMAP 连接中断；已保存完成进度，下次运行将断点续传"
+    elif budget_reached:
+        stop_reason = f"已达单次运行保守上限 {settings.max_messages_per_run} 封；可再次运行继续"
     return generate_target_report(
         ctx,
         criteria,
@@ -109,8 +148,8 @@ def scan_targets(
             "new_messages_checked": checked,
             "new_messages_saved": saved,
             "incremental_skipped": skipped,
-            "incomplete": volume_limited,
-            "stop_reason": "126 IMAP FETCH 下载流量已达到阶段性上限" if volume_limited else "",
+            "incomplete": volume_limited or interrupted or budget_reached,
+            "stop_reason": stop_reason,
             "errors": errors,
         },
     )

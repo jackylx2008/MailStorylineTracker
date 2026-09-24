@@ -9,6 +9,7 @@ from mail_storyline_tracker.modules.imap_client import (
     _or_search_keys,
     decode_modified_utf7,
     encode_modified_utf7,
+    is_imap_connection_error,
 )
 from mail_storyline_tracker.modules.storage import ArchiveStore
 
@@ -21,6 +22,10 @@ class StorageAndImapTests(unittest.TestCase):
     def test_fetch_volume_limit_is_detected_in_nested_response(self) -> None:
         self.assertTrue(_is_fetch_volume_limit([b"FETCH Fetch volume limit exceed"]))
         self.assertFalse(_is_fetch_volume_limit([b"ordinary fetch error"]))
+
+    def test_connection_errors_are_classified_for_safe_stop(self) -> None:
+        self.assertTrue(is_imap_connection_error(ConnectionResetError("reset")))
+        self.assertFalse(is_imap_connection_error(ValueError("bad input")))
 
     def test_multiple_terms_form_one_nested_or_search(self) -> None:
         self.assertEqual(
@@ -37,6 +42,14 @@ class StorageAndImapTests(unittest.TestCase):
             loaded = ArchiveStore(Path(directory))
             self.assertTrue(loaded.is_processed(key, "filter-a"))
             self.assertFalse(loaded.is_processed(key, "filter-b"))
+
+    def test_fetch_limit_cooldown_is_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArchiveStore(Path(directory))
+            blocked_until = store.mark_fetch_limited("demo@126.com", 24)
+            store.flush()
+            loaded = ArchiveStore(Path(directory))
+            self.assertEqual(loaded.fetch_blocked_until("demo@126.com"), blocked_until)
 
 
 if __name__ == "__main__":

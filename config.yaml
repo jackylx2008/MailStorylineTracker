@@ -17,7 +17,12 @@ mail:
   folders: ${MAIL_FOLDERS_JSON:-["INBOX"]}
   since: ${MAIL_SINCE:-2024-01-01}
   before: ${MAIL_BEFORE:-}
-  max_messages_per_folder: ${MAIL_MAX_MESSAGES_PER_FOLDER:-500}
+  max_messages_per_folder: ${MAIL_MAX_MESSAGES_PER_FOLDER:-50}
+  max_messages_per_run: ${MAIL_MAX_MESSAGES_PER_RUN:-50}
+  fetch_interval_seconds: ${MAIL_FETCH_INTERVAL_SECONDS:-1.5}
+  fetch_batch_size: ${MAIL_FETCH_BATCH_SIZE:-10}
+  fetch_batch_pause_seconds: ${MAIL_FETCH_BATCH_PAUSE_SECONDS:-20}
+  volume_limit_cooldown_hours: ${MAIL_VOLUME_LIMIT_COOLDOWN_HOURS:-24}
   filters:
     senders: ${MAIL_FILTER_SENDERS_JSON:-[]}
     recipients: ${MAIL_FILTER_RECIPIENTS_JSON:-[]}

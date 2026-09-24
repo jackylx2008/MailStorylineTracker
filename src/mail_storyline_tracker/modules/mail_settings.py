@@ -26,6 +26,11 @@ class MailSettings:
     since: str
     before: str
     max_messages_per_folder: int
+    max_messages_per_run: int
+    fetch_interval_seconds: float
+    fetch_batch_size: int
+    fetch_batch_pause_seconds: float
+    volume_limit_cooldown_hours: int
     senders: tuple[str, ...]
     recipients: tuple[str, ...]
     keywords: tuple[str, ...]
@@ -52,7 +57,12 @@ class MailSettings:
             folders=_strings(raw.get("folders")) or ("INBOX",),
             since=str(raw.get("since", "2024-01-01")),
             before=str(raw.get("before", "")),
-            max_messages_per_folder=int(raw.get("max_messages_per_folder", 500)),
+            max_messages_per_folder=int(raw.get("max_messages_per_folder", 50)),
+            max_messages_per_run=int(raw.get("max_messages_per_run", 50)),
+            fetch_interval_seconds=float(raw.get("fetch_interval_seconds", 1.5)),
+            fetch_batch_size=int(raw.get("fetch_batch_size", 10)),
+            fetch_batch_pause_seconds=float(raw.get("fetch_batch_pause_seconds", 20)),
+            volume_limit_cooldown_hours=int(raw.get("volume_limit_cooldown_hours", 24)),
             senders=_strings(raw.get("filters", {}).get("senders")),
             recipients=_strings(raw.get("filters", {}).get("recipients")),
             keywords=_strings(raw.get("filters", {}).get("keywords")),
@@ -84,6 +94,14 @@ class MailSettings:
             raise ValueError("至少选择一个邮件文件夹")
         if self.max_messages_per_folder <= 0:
             raise ValueError("每文件夹最多候选数必须是正整数")
+        if self.max_messages_per_run <= 0:
+            raise ValueError("单次运行最多处理数必须是正整数")
+        if self.fetch_interval_seconds < 0 or self.fetch_batch_pause_seconds < 0:
+            raise ValueError("FETCH 请求间隔和批次暂停不能为负数")
+        if self.fetch_batch_size <= 0:
+            raise ValueError("FETCH 批次大小必须是正整数")
+        if self.volume_limit_cooldown_hours < 24:
+            raise ValueError("依据 126 官方建议，流量限额冷却时间不能少于 24 小时")
 
     def validate_connection(self) -> None:
         if not self.host or not self.user or not self.password:

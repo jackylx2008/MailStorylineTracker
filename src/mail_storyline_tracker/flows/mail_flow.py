@@ -9,7 +9,7 @@ from typing import Any
 from ..config import AppContext
 from ..modules.ai_client import AISettings, OpenAICompatibleClient
 from ..modules.html_report import write_mail_review, write_storyline_report
-from ..modules.imap_client import FetchVolumeLimitError, Imap126Client
+from ..modules.imap_client import FetchVolumeLimitError, Imap126Client, is_imap_connection_error
 from ..modules.mail_parser import matches_filters, parse_message
 from ..modules.mail_settings import MailSettings
 from ..modules.storage import ArchiveStore
@@ -51,18 +51,41 @@ def download(ctx: AppContext, overrides: Mapping[str, Any] | None = None, progre
 def _scan(ctx: AppContext, overrides: Mapping[str, Any] | None, *, save: bool, progress: Progress | None) -> dict[str, Any]:
     settings = MailSettings.from_config(ctx.config).with_overrides(overrides)
     store = ArchiveStore(ctx.data_dir)
+    blocked_until = store.fetch_blocked_until(settings.user)
+    if blocked_until:
+        reason = f"126 官方建议流量超限后间隔 24 小时再试；本地保护暂停至 {blocked_until}"
+        logger.warning(reason)
+        return {
+            "mode": "download" if save else "preview",
+            "messages_checked": 0,
+            "messages_matched": 0,
+            "messages_saved": 0,
+            "incremental_skipped": 0,
+            "errors": [{"mailbox": "", "uid": "", "error": reason}],
+            "incomplete": True,
+            "stop_reason": reason,
+            "preview": [],
+            "review_html": "",
+        }
     seen = matched = saved = skipped_incremental = 0
     preview_rows: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     volume_limited = False
+    interrupted = False
+    budget_reached = False
+    stop_reason = ""
     with Imap126Client(settings) as client:
         for mailbox in settings.folders:
+            if seen >= settings.max_messages_per_run:
+                budget_reached = True
+                break
             try:
                 count, uidvalidity = client.select_mailbox(mailbox)
+                search_maximum = 0 if save else settings.max_messages_per_folder
                 uids, server_reasons = client.search_filtered_uids(
                     settings.since,
                     settings.before,
-                    settings.max_messages_per_folder,
+                    search_maximum,
                     settings.senders,
                     settings.recipients,
                     settings.keywords,
@@ -71,13 +94,23 @@ def _scan(ctx: AppContext, overrides: Mapping[str, Any] | None, *, save: bool, p
             except Exception as exc:
                 logger.exception("无法筛选邮箱文件夹：%s", mailbox)
                 errors.append({"mailbox": mailbox, "uid": "", "error": f"{type(exc).__name__}: {exc}"})
+                if is_imap_connection_error(exc):
+                    interrupted = True
+                    break
                 continue
             logger.info("扫描文件夹=%s 邮件总数=%s 搜索范围=%s", mailbox, count, len(uids))
+            folder_checked = 0
             for index, uid in enumerate(uids, start=1):
                 key = store.state_key(settings.user, mailbox, uidvalidity, uid)
                 if save and store.is_processed(key, settings.filter_signature):
                     skipped_incremental += 1
                     continue
+                if seen >= settings.max_messages_per_run:
+                    budget_reached = True
+                    break
+                if folder_checked >= settings.max_messages_per_folder:
+                    break
+                folder_checked += 1
                 seen += 1
                 if progress:
                     progress(f"{mailbox} UID {uid}", index, len(uids))
@@ -123,18 +156,36 @@ def _scan(ctx: AppContext, overrides: Mapping[str, Any] | None, *, save: bool, p
                         store.mark(key, message_id=record["message_id"], content_sha256=record["content_sha256"], status="saved", filter_signature=settings.filter_signature, record_id=stored["record_id"])
                     elif save:
                         store.mark(key, message_id=record["message_id"], content_sha256=record["content_sha256"], status="not_matched", filter_signature=settings.filter_signature)
+                    if save:
+                        # 每封邮件立即生成原子检查点，断网或进程退出后不重复下载。
+                        store.flush()
                 except FetchVolumeLimitError as exc:
                     volume_limited = True
+                    blocked_until = store.mark_fetch_limited(settings.user, settings.volume_limit_cooldown_hours)
                     logger.warning("扫描因 126 下载流量限制暂停：folder=%s uid=%s", mailbox, uid)
-                    errors.append({"mailbox": mailbox, "uid": uid, "error": f"{type(exc).__name__}: {exc}"})
+                    errors.append({
+                        "mailbox": mailbox,
+                        "uid": uid,
+                        "error": f"{type(exc).__name__}: {exc}；本地保护暂停至 {blocked_until}",
+                    })
                     break
                 except Exception as exc:
                     logger.exception("邮件处理失败：folder=%s uid=%s", mailbox, uid)
                     errors.append({"mailbox": mailbox, "uid": uid, "error": f"{type(exc).__name__}: {exc}"})
-            if volume_limited:
+                    if is_imap_connection_error(exc):
+                        interrupted = True
+                        break
+            if volume_limited or interrupted or budget_reached:
                 break
-    if save:
+    if volume_limited:
+        stop_reason = f"126 IMAP FETCH 下载流量已达到阶段性上限；依据官方建议暂停至 {blocked_until}"
+    elif interrupted:
+        stop_reason = "IMAP 连接中断；已保存完成进度，下次运行将断点续传"
+    elif budget_reached:
+        stop_reason = f"已达单次运行保守上限 {settings.max_messages_per_run} 封；可再次运行继续"
+    if save or volume_limited:
         store.flush()
+    if save:
         review_path = write_mail_review(store.records(), ctx.output_dir / "mail_review.html")
     else:
         review_path = None
@@ -145,8 +196,8 @@ def _scan(ctx: AppContext, overrides: Mapping[str, Any] | None, *, save: bool, p
         "messages_saved": saved,
         "incremental_skipped": skipped_incremental,
         "errors": errors,
-        "incomplete": volume_limited,
-        "stop_reason": "126 IMAP FETCH 下载流量已达到阶段性上限" if volume_limited else "",
+        "incomplete": volume_limited or interrupted or budget_reached,
+        "stop_reason": stop_reason,
         "preview": preview_rows,
         "review_html": str(review_path) if review_path is not None else "",
     }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import imaplib
 from email.message import EmailMessage
 from pathlib import Path
 from unittest.mock import patch
@@ -50,6 +51,18 @@ class FakeImapClient:
 
     def fetch_message_preview(self, uid: str, max_bytes: int):
         return self.messages[uid][:max_bytes]
+
+
+class PagedFakeImapClient(FakeImapClient):
+    def search_filtered_uids(self, since, before, maximum, senders, recipients, keywords, match_mode):
+        return ["2", "1"], {"2": [], "1": []}
+
+
+class DisconnectingFakeImapClient(PagedFakeImapClient):
+    def fetch_message_preview(self, uid: str, max_bytes: int):
+        if uid == "1":
+            raise imaplib.IMAP4.abort("socket closed")
+        return super().fetch_message_preview(uid, max_bytes)
 
 
 class MailFlowTests(unittest.TestCase):
@@ -111,6 +124,64 @@ class MailFlowTests(unittest.TestCase):
             self.assertEqual(result["messages_checked"], 1)
             self.assertEqual(result["messages_matched"], 1)
             self.assertFalse(result["incomplete"])
+
+    def test_download_advances_past_processed_latest_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = {
+                "app": {"data_dir": "data", "output_dir": "output"},
+                "mail": {
+                    "imap": {"host": "imap.126.com", "port": 993, "user": "demo@126.com", "password": "secret"},
+                    "folders": ["INBOX"],
+                    "max_messages_per_folder": 1,
+                    "filters": {"match_mode": "any"},
+                },
+            }
+            ctx = AppContext(root, config)
+            with patch("mail_storyline_tracker.flows.mail_flow.Imap126Client", PagedFakeImapClient):
+                first = download(ctx)
+                second = download(ctx)
+            self.assertEqual(first["messages_saved"], 1)
+            self.assertEqual(second["messages_saved"], 1)
+            self.assertEqual(len(list((root / "data" / "raw_mail" / "INBOX" / "eml").glob("*.eml"))), 2)
+
+    def test_global_run_budget_stops_safely_across_folders(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = {
+                "app": {"data_dir": "data", "output_dir": "output"},
+                "mail": {
+                    "imap": {"host": "imap.126.com", "port": 993, "user": "demo@126.com", "password": "secret"},
+                    "folders": ["INBOX", "archive"],
+                    "max_messages_per_folder": 50,
+                    "max_messages_per_run": 1,
+                    "filters": {"match_mode": "any"},
+                },
+            }
+            with patch("mail_storyline_tracker.flows.mail_flow.Imap126Client", PagedFakeImapClient):
+                result = download(AppContext(root, config))
+            self.assertEqual(result["messages_checked"], 1)
+            self.assertTrue(result["incomplete"])
+            self.assertIn("单次运行保守上限", result["stop_reason"])
+
+    def test_connection_abort_stops_and_keeps_completed_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = {
+                "app": {"data_dir": "data", "output_dir": "output"},
+                "mail": {
+                    "imap": {"host": "imap.126.com", "port": 993, "user": "demo@126.com", "password": "secret"},
+                    "folders": ["INBOX"],
+                    "filters": {"match_mode": "any"},
+                },
+            }
+            ctx = AppContext(root, config)
+            with patch("mail_storyline_tracker.flows.mail_flow.Imap126Client", DisconnectingFakeImapClient):
+                first = download(ctx)
+                second = download(ctx)
+            self.assertTrue(first["incomplete"])
+            self.assertIn("断点续传", first["stop_reason"])
+            self.assertEqual(second["incremental_skipped"], 1)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,7 @@ class ArchiveStore:
         self.state_path = data_dir / "state" / "mail_sync_state.json"
         self.records_path = data_dir / "records" / "mail_records.json"
         self._state = _read_json(self.state_path, {"version": 1, "items": {}})
+        self._state.setdefault("fetch_limits", {})
         self._records = _read_json(self.records_path, {"version": 1, "records": {}})
 
     @staticmethod
@@ -35,6 +36,27 @@ class ArchiveStore:
             "record_id": record_id,
             "processed_at": datetime.now(timezone.utc).isoformat(),
         }
+
+    def fetch_blocked_until(self, account: str) -> str:
+        item = self._state["fetch_limits"].get(account.lower(), {})
+        value = str(item.get("blocked_until", ""))
+        if not value:
+            return ""
+        try:
+            blocked_until = datetime.fromisoformat(value)
+        except ValueError:
+            return ""
+        return value if blocked_until > datetime.now(timezone.utc) else ""
+
+    def mark_fetch_limited(self, account: str, cooldown_hours: int) -> str:
+        now = datetime.now(timezone.utc)
+        blocked_until = now + timedelta(hours=cooldown_hours)
+        self._state["fetch_limits"][account.lower()] = {
+            "detected_at": now.isoformat(),
+            "blocked_until": blocked_until.isoformat(),
+            "reason": "126 IMAP FETCH volume limit exceed",
+        }
+        return blocked_until.isoformat()
 
     def save_message(self, raw_bytes: bytes, record: dict[str, Any]) -> dict[str, Any]:
         folder = safe_filename(record["mailbox"])
