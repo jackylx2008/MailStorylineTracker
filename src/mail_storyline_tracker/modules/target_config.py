@@ -22,6 +22,22 @@ class TargetCriteria:
         criteria.validate()
         return criteria
 
+    @classmethod
+    def from_values(
+        cls,
+        emails: str | tuple[str, ...] | list[str],
+        keywords: str | tuple[str, ...] | list[str],
+        files: str | tuple[str, ...] | list[str],
+    ) -> "TargetCriteria":
+        """从 GUI 多行文本或序列构建当前运行使用的目标配置。"""
+        criteria = cls(
+            emails=_normalize_values(emails),
+            keywords=_normalize_values(keywords),
+            files=_normalize_values(files),
+        )
+        criteria.validate()
+        return criteria
+
     def validate(self) -> None:
         if not self.emails and not self.keywords and not self.files:
             raise ValueError("target_email.env、target_keyword.env 和 target_file.env 均为空")
@@ -43,8 +59,13 @@ class TargetCriteria:
 def _read_lines(path: Path) -> tuple[str, ...]:
     if not path.exists():
         raise FileNotFoundError(f"缺少本地目标配置：{path.name}")
+    return _normalize_values(path.read_text(encoding="utf-8-sig"))
+
+
+def _normalize_values(value: str | tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    raw_values = value.splitlines() if isinstance(value, str) else value
     values: list[str] = []
-    for raw in path.read_text(encoding="utf-8-sig").splitlines():
+    for raw in raw_values:
         value = raw.strip()
         if not value or value.startswith("#"):
             continue

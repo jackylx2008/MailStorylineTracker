@@ -44,6 +44,7 @@ class AISettings:
 class OpenAICompatibleClient:
     def __init__(self, settings: AISettings) -> None:
         self.settings = settings
+        self.resolved_model = ""
         parsed = urlparse(settings.base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise ValueError("AI base_url 无效")
@@ -66,10 +67,11 @@ class OpenAICompatibleClient:
             selected = ids[0]
         if ids and selected not in ids:
             raise RuntimeError(f"配置模型不可用：{self.settings.model}；可用模型：{ids}")
+        self.resolved_model = selected
         return {"status": "ok", "models": ids, "resolved_model": selected}
 
     def summarize(self, conversations: list[dict[str, Any]]) -> dict[str, Any]:
-        check = self.check()
+        check = {"resolved_model": self.resolved_model} if self.resolved_model else self.check()
         prompt = build_prompt(conversations, self.settings)
         payload = {
             "model": check["resolved_model"],
@@ -93,7 +95,7 @@ class OpenAICompatibleClient:
         unique_names = list(dict.fromkeys(name.strip() for name in filenames if name.strip()))
         if not unique_names:
             return {}
-        check = self.check()
+        check = {"resolved_model": self.resolved_model} if self.resolved_model else self.check()
         prompt = (
             "请对附件文件名和目标事项名称进行中文语义模糊匹配。允许文件名包含日期、版本号、回复、更新、"
             "确认、审核、序号和扩展名，也允许同义表达；不能仅因都属于同一专业就判定匹配。"

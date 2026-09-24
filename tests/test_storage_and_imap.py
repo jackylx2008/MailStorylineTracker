@@ -4,7 +4,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mail_storyline_tracker.modules.imap_client import decode_modified_utf7, encode_modified_utf7
+from mail_storyline_tracker.modules.imap_client import (
+    _is_fetch_volume_limit,
+    _or_search_keys,
+    decode_modified_utf7,
+    encode_modified_utf7,
+)
 from mail_storyline_tracker.modules.storage import ArchiveStore
 
 
@@ -12,6 +17,16 @@ class StorageAndImapTests(unittest.TestCase):
     def test_modified_utf7_round_trip(self) -> None:
         for value in ("INBOX", "已发送", "项目&A"):
             self.assertEqual(decode_modified_utf7(encode_modified_utf7(value)), value)
+
+    def test_fetch_volume_limit_is_detected_in_nested_response(self) -> None:
+        self.assertTrue(_is_fetch_volume_limit([b"FETCH Fetch volume limit exceed"]))
+        self.assertFalse(_is_fetch_volume_limit([b"ordinary fetch error"]))
+
+    def test_multiple_terms_form_one_nested_or_search(self) -> None:
+        self.assertEqual(
+            _or_search_keys("TEXT", ("声学", "减震", "噪声")),
+            ["OR", "TEXT", "声学".encode("utf-8").join((b'"', b'"')), "OR", "TEXT", "减震".encode("utf-8").join((b'"', b'"')), "TEXT", "噪声".encode("utf-8").join((b'"', b'"'))],
+        )
 
     def test_incremental_state_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

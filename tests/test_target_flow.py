@@ -43,6 +43,16 @@ class TargetFlowTests(unittest.TestCase):
             criteria = TargetCriteria.load(root)
             self.assertEqual(criteria.files, ("事项甲", "事项乙"))
 
+    def test_gui_multiline_values_ignore_comments_and_duplicates(self) -> None:
+        criteria = TargetCriteria.from_values(
+            "a@example.com\n# comment\na@example.com\n",
+            "审核\n验收\n",
+            "事项甲\n事项乙\n事项甲\n",
+        )
+        self.assertEqual(criteria.emails, ("a@example.com",))
+        self.assertEqual(criteria.keywords, ("审核", "验收"))
+        self.assertEqual(criteria.files, ("事项甲", "事项乙"))
+
     def test_ai_filename_matcher_keeps_only_known_targets(self) -> None:
         settings = AISettings("http://127.0.0.1:8080/v1", "local-model", "", False, 10, 100, 0, 1000, 100)
         client = OpenAICompatibleClient(settings)
@@ -65,11 +75,21 @@ class TargetFlowTests(unittest.TestCase):
         self.assertEqual(len(result["targets"][0]["events"]), 2)
         self.assertEqual(len(result["targets"][1]["events"]), 0)
         with tempfile.TemporaryDirectory() as directory:
-            path = write_target_mindmap({**result, "generated_at": "2026-09-24"}, Path(directory) / "map.html")
+            path = write_target_mindmap(
+                {
+                    **result,
+                    "generated_at": "2026-09-24",
+                    "incomplete": True,
+                    "stop_reason": "测试限流",
+                },
+                Path(directory) / "map.html",
+            )
             content = path.read_text(encoding="utf-8")
             self.assertIn("附件往来沟通链路", content)
             self.assertIn("示例审核意见", content)
             self.assertIn("折叠全部", content)
+            self.assertIn("部分扫描结果", content)
+            self.assertIn("测试限流", content)
 
 
 if __name__ == "__main__":

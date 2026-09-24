@@ -34,12 +34,13 @@ if str(SRC) not in sys.path:
 from logging_config import configure_utf8_stdio, setup_logger
 from mail_storyline_tracker.config import bootstrap
 from mail_storyline_tracker.flows.mail_flow import analyze, check_ai, check_connection, check_login, download, list_folders, preview
-from mail_storyline_tracker.flows.target_flow import scan_targets
+from mail_storyline_tracker.flows.target_flow import generate_target_report, scan_targets
+from mail_storyline_tracker.modules.target_config import TargetCriteria
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("action", choices=("check-login", "check-mail", "list-folders", "preview", "download", "target-scan", "check-ai", "analyze", "all"))
+    parser.add_argument("action", choices=("check-login", "check-mail", "list-folders", "preview", "download", "target-scan", "target-report", "check-ai", "analyze", "all"))
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--folders", help="逗号分隔的邮箱文件夹")
     parser.add_argument("--senders", help="逗号分隔的发件人地址或片段")
@@ -48,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--match-mode", choices=("any", "all"))
     parser.add_argument("--since", help="起始日期 YYYY-MM-DD")
     parser.add_argument("--before", help="结束日期 YYYY-MM-DD，不含当日")
+    parser.add_argument("--max-messages-per-folder", type=int, help="每个文件夹最多检查的最新候选邮件数")
     return parser.parse_args()
 
 
@@ -56,7 +58,21 @@ def main() -> int:
     args = parse_args()
     ctx = bootstrap(PROJECT_ROOT, args.config)
     setup_logger(ctx.config.get("app", {}).get("log_level", "INFO"))
-    overrides = {key: value for key, value in vars(args).items() if key in {"folders", "senders", "recipients", "keywords", "match_mode", "since", "before"} and value is not None}
+    overrides = {
+        key: value
+        for key, value in vars(args).items()
+        if key in {
+            "folders",
+            "senders",
+            "recipients",
+            "keywords",
+            "match_mode",
+            "since",
+            "before",
+            "max_messages_per_folder",
+        }
+        and value is not None
+    }
     if args.action == "check-login":
         result = check_login(ctx)
     elif args.action == "check-mail":
@@ -69,6 +85,8 @@ def main() -> int:
         result = download(ctx, overrides)
     elif args.action == "target-scan":
         result = scan_targets(ctx)
+    elif args.action == "target-report":
+        result = generate_target_report(ctx, TargetCriteria.load(PROJECT_ROOT), {"incomplete": True, "stop_reason": "仅使用当前本地增量数据生成"})
     elif args.action == "check-ai":
         result = check_ai(ctx)
     elif args.action == "analyze":

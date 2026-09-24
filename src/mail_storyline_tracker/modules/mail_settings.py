@@ -71,6 +71,8 @@ class MailSettings:
         for name in ("since", "before", "match_mode"):
             if name in values and values[name] is not None:
                 changes[name] = str(values[name]).strip()
+        if "max_messages_per_folder" in values and values["max_messages_per_folder"] is not None:
+            changes["max_messages_per_folder"] = int(str(values["max_messages_per_folder"]).strip())
         result = replace(self, **changes)
         result.validate_filters()
         return result
@@ -80,6 +82,8 @@ class MailSettings:
             raise ValueError("匹配方式必须是 any 或 all")
         if not self.folders:
             raise ValueError("至少选择一个邮件文件夹")
+        if self.max_messages_per_folder <= 0:
+            raise ValueError("每文件夹最多候选数必须是正整数")
 
     def validate_connection(self) -> None:
         if not self.host or not self.user or not self.password:

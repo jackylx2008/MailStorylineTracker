@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, scrolledtext, ttk
 
 from ..config import AppContext
 from ..flows.mail_flow import analyze, check_ai, check_connection, download, list_folders, preview
@@ -39,6 +39,7 @@ class MailStorylineApp:
         self.started_at = 0.0
         self.last_html = ""
         self.variables: dict[str, tk.Variable] = {}
+        self.target_inputs: dict[str, scrolledtext.ScrolledText] = {}
         self.action_buttons: list[ttk.Button] = []
         self.status = tk.StringVar(value="就绪")
         self.current = tk.StringVar(value="")
@@ -98,22 +99,29 @@ class MailStorylineApp:
             ("keywords", "主题/正文关键词", ",".join(settings.keywords)),
             ("since", "起始日期", settings.since),
             ("before", "结束日期（不含，可留空）", settings.before),
+            ("max_messages_per_folder", "每文件夹最多候选数", str(settings.max_messages_per_folder)),
         )
         for row, (key, label, default) in enumerate(fields):
             ttk.Label(tab, text=label).grid(row=row, column=0, sticky="w", padx=5, pady=6)
             variable = tk.StringVar(value=default)
             self.variables[key] = variable
             ttk.Entry(tab, textvariable=variable).grid(row=row, column=1, sticky="ew", padx=5, pady=6)
-        ttk.Label(tab, text="匹配方式").grid(row=6, column=0, sticky="w", padx=5, pady=6)
+        ttk.Label(tab, text="匹配方式").grid(row=7, column=0, sticky="w", padx=5, pady=6)
         mode = tk.StringVar(value=settings.match_mode)
         self.variables["match_mode"] = mode
-        ttk.Combobox(tab, textvariable=mode, values=("any", "all"), state="readonly").grid(row=6, column=1, sticky="ew", padx=5, pady=6)
+        ttk.Combobox(tab, textvariable=mode, values=("any", "all"), state="readonly").grid(row=7, column=1, sticky="ew", padx=5, pady=6)
         tab.columnconfigure(1, weight=1)
         buttons = ttk.Frame(tab)
-        buttons.grid(row=7, column=0, columnspan=2, sticky="ew", pady=14)
+        buttons.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(14, 5))
         self._button(buttons, "检查连接", lambda: self._run("检查邮箱连接", lambda: check_connection(self.ctx, self._overrides()))).pack(side="left", padx=4)
         self._button(buttons, "列出文件夹", lambda: self._run("读取邮箱文件夹", lambda: {"folders": list_folders(self.ctx)})).pack(side="left", padx=4)
         self._button(buttons, "筛选预览", lambda: self._run("筛选预览", lambda: preview(self.ctx, self._overrides(), self._progress_callback))).pack(side="left", padx=4)
+        ttk.Label(
+            tab,
+            text="文件夹名必须与“列出文件夹”的结果完全一致；预览会先筛日期、地址和主题，只读取候选邮件前 16 KB，不下载附件。",
+            foreground="#555555",
+            wraplength=900,
+        ).grid(row=9, column=0, columnspan=2, sticky="w", padx=5, pady=6)
 
     def _build_archive_tab(self, notebook: ttk.Notebook) -> None:
         tab = ttk.Frame(notebook, padding=14)
@@ -147,18 +155,65 @@ class MailStorylineApp:
             criteria = TargetCriteria.load(self.ctx.project_root)
             summary = f"目标联系人 {len(criteria.emails)} 个 · 关键词 {len(criteria.keywords)} 个 · 独立附件事项 {len(criteria.files)} 个"
         except Exception as exc:
+            criteria = TargetCriteria((), (), ())
             summary = f"目标配置尚未就绪：{exc}"
         ttk.Label(tab, text=summary, wraplength=850).pack(anchor="w", pady=10)
         ttk.Label(
             tab,
-            text="扫描登录账号下全部可选择文件夹；联系人、关键词、附件名任一命中即归档。附件名由本地 AI 模糊匹配，不读取附件正文。",
+            text="以下内容默认读取 target_*.env；每行一个值。可在本次运行前编辑，界面修改不会写回文件。联系人、关键词、附件名任一命中即归档。",
             wraplength=850,
         ).pack(anchor="w", pady=5)
+        editors = ttk.Frame(tab)
+        editors.pack(fill="both", expand=True, pady=6)
+        definitions = (
+            ("emails", "目标联系人（target_email.env）", criteria.emails),
+            ("keywords", "目标关键词（target_keyword.env）", criteria.keywords),
+            ("files", "独立附件事项（target_file.env）", criteria.files),
+        )
+        for column, (key, title, values) in enumerate(definitions):
+            box = ttk.LabelFrame(editors, text=title, padding=5)
+            box.grid(row=0, column=column, sticky="nsew", padx=4)
+            editor = scrolledtext.ScrolledText(box, height=11, wrap="word", font=("Microsoft YaHei UI", 10))
+            editor.pack(fill="both", expand=True)
+            editor.insert("1.0", "\n".join(values))
+            self.target_inputs[key] = editor
+            editors.columnconfigure(column, weight=1)
+        editors.rowconfigure(0, weight=1)
         ttk.Label(tab, text=f"思维导图式结果：{self.ctx.output_dir / 'target_storylines.html'}").pack(anchor="w", pady=5)
         row = ttk.Frame(tab)
-        row.pack(anchor="w", pady=18)
-        self._button(row, "扫描并生成沟通链路", lambda: self._run("目标附件链路", lambda: scan_targets(self.ctx, self._progress_callback))).pack(side="left", padx=4)
+        row.pack(anchor="w", pady=8)
+        self._button(row, "扫描并生成沟通链路", self._start_target_scan).pack(side="left", padx=4)
+        ttk.Button(row, text="从文件重新载入", command=self._reload_target_defaults).pack(side="left", padx=4)
         ttk.Button(row, text="打开沟通链路页面", command=lambda: self._open(self.ctx.output_dir / "target_storylines.html")).pack(side="left", padx=4)
+
+    def _start_target_scan(self) -> None:
+        try:
+            criteria = self._target_criteria()
+        except Exception as exc:
+            messagebox.showerror("目标配置错误", str(exc))
+            return
+        self._run(
+            "目标附件链路",
+            lambda: scan_targets(self.ctx, self._progress_callback, criteria),
+        )
+
+    def _target_criteria(self) -> TargetCriteria:
+        return TargetCriteria.from_values(
+            self.target_inputs["emails"].get("1.0", "end"),
+            self.target_inputs["keywords"].get("1.0", "end"),
+            self.target_inputs["files"].get("1.0", "end"),
+        )
+
+    def _reload_target_defaults(self) -> None:
+        try:
+            criteria = TargetCriteria.load(self.ctx.project_root)
+        except Exception as exc:
+            messagebox.showerror("读取目标配置失败", str(exc))
+            return
+        for key, values in (("emails", criteria.emails), ("keywords", criteria.keywords), ("files", criteria.files)):
+            editor = self.target_inputs[key]
+            editor.delete("1.0", "end")
+            editor.insert("1.0", "\n".join(values))
 
     def _build_config_tab(self, notebook: ttk.Notebook) -> None:
         tab = ttk.Frame(notebook, padding=14)

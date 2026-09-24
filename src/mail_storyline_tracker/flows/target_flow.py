@@ -9,7 +9,7 @@ from typing import Any
 from ..config import AppContext
 from ..modules.ai_client import AISettings, OpenAICompatibleClient
 from ..modules.html_report import write_target_mindmap
-from ..modules.imap_client import Imap126Client
+from ..modules.imap_client import FetchVolumeLimitError, Imap126Client
 from ..modules.mail_parser import parse_message
 from ..modules.mail_settings import MailSettings
 from ..modules.storage import ArchiveStore
@@ -19,16 +19,25 @@ from ..modules.threading import group_conversations
 
 logger = logging.getLogger(__name__)
 Progress = Callable[[str, int, int], None]
+TARGET_SCAN_BATCH_SIZE = 10
+TARGET_SCAN_PREVIEW_BYTES = 128 * 1024
 
 
-def scan_targets(ctx: AppContext, progress: Progress | None = None) -> dict[str, Any]:
-    criteria = TargetCriteria.load(ctx.project_root)
+def scan_targets(
+    ctx: AppContext,
+    progress: Progress | None = None,
+    criteria: TargetCriteria | None = None,
+) -> dict[str, Any]:
+    criteria = criteria or TargetCriteria.load(ctx.project_root)
     settings = MailSettings.from_config(ctx.config)
     ai = OpenAICompatibleClient(AISettings.from_config(ctx.config))
     ai.check()
     store = ArchiveStore(ctx.data_dir)
-    pending: list[tuple[str, bytes, dict[str, Any]]] = []
+    batch: list[tuple[str, bytes, dict[str, Any]]] = []
     skipped = 0
+    checked = 0
+    saved = 0
+    volume_limited = False
     errors: list[dict[str, str]] = []
 
     with Imap126Client(settings) as client:
@@ -50,7 +59,7 @@ def scan_targets(ctx: AppContext, progress: Progress | None = None) -> dict[str,
                 if progress:
                     progress(f"{mailbox.name} UID {uid}", message_index, len(uids))
                 try:
-                    raw = client.fetch_message(uid)
+                    raw = client.fetch_message_preview(uid, TARGET_SCAN_PREVIEW_BYTES)
                     if progress:
                         progress(f"{mailbox.name} UID {uid}", message_index, len(uids))
                     record = parse_message(
@@ -60,16 +69,79 @@ def scan_targets(ctx: AppContext, progress: Progress | None = None) -> dict[str,
                         uidvalidity=uidvalidity,
                         uid=uid,
                     )
-                    pending.append((key, raw, record))
+                    record["source_truncated"] = True
+                    batch.append((key, raw, record))
+                    checked += 1
+                    if len(batch) >= TARGET_SCAN_BATCH_SIZE:
+                        saved += _process_batch(batch, store, criteria, ai)
+                        batch.clear()
+                    if message_index == 1 or message_index == len(uids) or message_index % 25 == 0:
+                        logger.info(
+                            "目标扫描邮件进度：folder=%s %s/%s checked=%s saved=%s skipped=%s",
+                            mailbox.name,
+                            message_index,
+                            len(uids),
+                            checked,
+                            saved,
+                            skipped,
+                        )
+                except FetchVolumeLimitError as exc:
+                    volume_limited = True
+                    logger.warning("目标扫描因 126 下载流量限制暂停：folder=%s uid=%s", mailbox.name, uid)
+                    errors.append({"mailbox": mailbox.name, "uid": uid, "error": str(exc)})
+                    break
                 except Exception as exc:
                     logger.exception("邮件处理失败：folder=%s uid=%s", mailbox.name, uid)
                     errors.append({"mailbox": mailbox.name, "uid": uid, "error": f"{type(exc).__name__}: {exc}"})
+            if batch:
+                saved += _process_batch(batch, store, criteria, ai)
+                batch.clear()
             logger.info("目标扫描进度：文件夹 %s/%s %s", folder_index, total_folders, mailbox.name)
+            if volume_limited:
+                break
 
-    filenames = [item["filename"] for _, _, record in pending for item in record.get("attachments", [])]
+    store.flush()
+    return generate_target_report(
+        ctx,
+        criteria,
+        {
+            "folders_discovered": total_folders,
+            "new_messages_checked": checked,
+            "new_messages_saved": saved,
+            "incremental_skipped": skipped,
+            "incomplete": volume_limited,
+            "stop_reason": "126 IMAP FETCH 下载流量已达到阶段性上限" if volume_limited else "",
+            "errors": errors,
+        },
+    )
+
+
+def generate_target_report(
+    ctx: AppContext,
+    criteria: TargetCriteria | None = None,
+    run_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    criteria = criteria or TargetCriteria.load(ctx.project_root)
+    store = ArchiveStore(ctx.data_dir)
+    result = build_target_storylines(store.records(), criteria)
+    result.update({"generated_at": datetime.now(timezone.utc).isoformat(), **(run_metadata or {})})
+    output_json = ctx.output_dir / "target_storylines.json"
+    output_json.parent.mkdir(parents=True, exist_ok=True)
+    output_json.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    output_html = write_target_mindmap(result, ctx.output_dir / "target_storylines.html")
+    return {"json": str(output_json), "html": str(output_html), "summary": _summary(result)}
+
+
+def _process_batch(
+    batch: list[tuple[str, bytes, dict[str, Any]]],
+    store: ArchiveStore,
+    criteria: TargetCriteria,
+    ai: OpenAICompatibleClient,
+) -> int:
+    filenames = [item["filename"] for _, _, record in batch for item in record.get("attachments", [])]
     filename_matches = ai.match_attachment_names(filenames, list(criteria.files))
     saved = 0
-    for key, raw, record in pending:
+    for key, raw, record in batch:
         reasons = _or_match_reasons(record, criteria, filename_matches)
         record["matched_by"] = reasons
         record["target_matches"] = _record_target_matches(record, filename_matches)
@@ -90,22 +162,7 @@ def scan_targets(ctx: AppContext, progress: Progress | None = None) -> dict[str,
             record_id=record_id,
         )
     store.flush()
-    result = build_target_storylines(store.records(), criteria)
-    result.update(
-        {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "folders_scanned": total_folders,
-            "new_messages_checked": len(pending),
-            "new_messages_saved": saved,
-            "incremental_skipped": skipped,
-            "errors": errors,
-        }
-    )
-    output_json = ctx.output_dir / "target_storylines.json"
-    output_json.parent.mkdir(parents=True, exist_ok=True)
-    output_json.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    output_html = write_target_mindmap(result, ctx.output_dir / "target_storylines.html")
-    return {"json": str(output_json), "html": str(output_html), "summary": _summary(result)}
+    return saved
 
 
 def build_target_storylines(records: list[dict[str, Any]], criteria: TargetCriteria) -> dict[str, Any]:
@@ -221,7 +278,8 @@ def _summary(result: dict[str, Any]) -> dict[str, Any]:
         "targets": len(result["targets"]),
         "targets_with_events": sum(1 for item in result["targets"] if item["events"]),
         "matched_messages": result["matched_messages"],
-        "folders_scanned": result["folders_scanned"],
-        "new_messages_saved": result["new_messages_saved"],
-        "errors": len(result["errors"]),
+        "folders_discovered": result.get("folders_discovered", 0),
+        "new_messages_saved": result.get("new_messages_saved", 0),
+        "incomplete": result.get("incomplete", False),
+        "errors": len(result.get("errors", [])),
     }

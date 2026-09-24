@@ -39,14 +39,16 @@ class ArchiveStore:
     def save_message(self, raw_bytes: bytes, record: dict[str, Any]) -> dict[str, Any]:
         folder = safe_filename(record["mailbox"])
         stem = f"{record['uid']}_{record['content_sha256'][:12]}"
-        eml_path = self.raw_dir / folder / "eml" / f"{stem}.eml"
+        suffix = ".eml.partial" if record.get("source_truncated") else ".eml"
+        eml_path = self.raw_dir / folder / "eml" / f"{stem}{suffix}"
         eml_path.parent.mkdir(parents=True, exist_ok=True)
         if not eml_path.exists():
             eml_path.write_bytes(raw_bytes)
         record["eml_path"] = str(eml_path)
         target_dir = self.raw_dir / folder / "attachments" / stem
         public = public_record(record)
-        for attachment, (filename, payload) in zip(public["attachments"], attachment_payloads(record)):
+        payload_items = [] if record.get("source_truncated") else attachment_payloads(record)
+        for attachment, (filename, payload) in zip(public["attachments"], payload_items):
             if not payload:
                 continue
             target_dir.mkdir(parents=True, exist_ok=True)

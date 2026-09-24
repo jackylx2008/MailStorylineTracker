@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mail_storyline_tracker.config import AppContext
-from mail_storyline_tracker.flows.mail_flow import check_login, download
+from mail_storyline_tracker.flows.mail_flow import check_login, download, preview
 
 
 def _message(sender: str, subject: str, body: str, message_id: str) -> bytes:
@@ -42,8 +42,14 @@ class FakeImapClient:
     def search_uids(self, since: str, before: str, maximum: int):
         return list(self.messages)
 
+    def search_filtered_uids(self, since, before, maximum, senders, recipients, keywords, match_mode):
+        return ["1"], {"1": ["主题/正文关键词"]}
+
     def fetch_message(self, uid: str):
         return self.messages[uid]
+
+    def fetch_message_preview(self, uid: str, max_bytes: int):
+        return self.messages[uid][:max_bytes]
 
 
 class MailFlowTests(unittest.TestCase):
@@ -81,13 +87,30 @@ class MailFlowTests(unittest.TestCase):
             with patch("mail_storyline_tracker.flows.mail_flow.Imap126Client", FakeImapClient):
                 first = download(ctx)
                 second = download(ctx)
-            self.assertEqual(first["messages_checked"], 2)
+            self.assertEqual(first["messages_checked"], 1)
             self.assertEqual(first["messages_matched"], 1)
             self.assertEqual(first["messages_saved"], 1)
             self.assertEqual(second["messages_checked"], 0)
-            self.assertEqual(second["incremental_skipped"], 2)
+            self.assertEqual(second["incremental_skipped"], 1)
             self.assertTrue((root / "output" / "mail_review.html").exists())
             self.assertEqual(len(list((root / "data" / "raw_mail" / "INBOX" / "eml").glob("*.eml"))), 1)
+
+    def test_preview_uses_server_candidates_and_partial_fetch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = {
+                "app": {"data_dir": "data", "output_dir": "output"},
+                "mail": {
+                    "imap": {"host": "imap.126.com", "port": 993, "user": "demo@126.com", "password": "secret"},
+                    "folders": ["INBOX"],
+                    "filters": {"keywords": ["验收"], "match_mode": "any"},
+                },
+            }
+            with patch("mail_storyline_tracker.flows.mail_flow.Imap126Client", FakeImapClient):
+                result = preview(AppContext(root, config))
+            self.assertEqual(result["messages_checked"], 1)
+            self.assertEqual(result["messages_matched"], 1)
+            self.assertFalse(result["incomplete"])
 
 
 if __name__ == "__main__":

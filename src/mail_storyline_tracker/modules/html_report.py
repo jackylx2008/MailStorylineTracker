@@ -59,6 +59,10 @@ def write_storyline_report(result: dict[str, Any], path: Path) -> Path:
 def write_target_mindmap(result: dict[str, Any], path: Path) -> Path:
     """生成单文件、离线可搜索的事项沟通链路与时间线。"""
     payload = json.dumps(result, ensure_ascii=False).replace("<", "\\u003c")
+    warning = ""
+    if result.get("incomplete"):
+        reason = html.escape(str(result.get("stop_reason") or "扫描尚未完成"))
+        warning = f'<div class="warning" role="alert"><strong>部分扫描结果</strong><span>{reason}。重新运行后会从已保存的 UID 状态继续。</span></div>'
     path.parent.mkdir(parents=True, exist_ok=True)
     document = f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>附件往来沟通链路</title><style>
@@ -68,6 +72,7 @@ header{{background:linear-gradient(120deg,#10284d,#245c98);color:#fff;padding:26
 .toolbar{{position:sticky;top:0;z-index:5;display:flex;gap:8px;flex-wrap:wrap;padding:12px max(16px,4vw);background:#ffffffee;border-bottom:1px solid #d5deea;backdrop-filter:blur(8px)}}
 input{{flex:1;min-width:240px;padding:9px 11px;border:1px solid #aebbd0;border-radius:7px;font:inherit}}button{{padding:8px 12px;border:1px solid #aebbd0;border-radius:7px;background:#fff;color:var(--ink);font:inherit}}
 main{{max-width:1380px;margin:22px auto;padding:0 18px 50px}}.root{{width:max-content;max-width:90%;margin:0 auto 24px;padding:13px 22px;border-radius:10px;background:var(--primary);color:#fff;text-align:center}}
+.warning{{max-width:1380px;margin:18px auto 0;padding:12px 18px;border:1px solid #e6b46f;border-radius:9px;background:#fff5df;color:#764411;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}}.warning strong{{font-size:15px}}
 .topics{{position:relative}}.topics:before{{content:"";position:absolute;left:24px;top:0;bottom:0;width:2px;background:var(--line)}}
 details{{position:relative;margin:0 0 16px 54px;background:var(--surface);border:1px solid #d8e0eb;border-radius:10px;box-shadow:0 4px 14px #243b5a12}}
 details:before{{content:"";position:absolute;left:-30px;top:25px;width:30px;height:2px;background:var(--line)}}summary{{padding:14px 16px;font-size:16px;font-weight:500;list-style:none;display:flex;align-items:center;gap:10px}}summary::-webkit-details-marker{{display:none}}
@@ -77,7 +82,7 @@ details:before{{content:"";position:absolute;left:-30px;top:25px;width:30px;heig
 .event-head{{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}}.time{{color:var(--primary);font-weight:500}}.action{{font-weight:500}}.route,.subject,.attachments,.source{{margin-top:4px}}.route,.source{{color:var(--muted);font-size:12px}}.attachments{{color:var(--accent)}}
 .match{{display:inline-block;margin:4px 5px 0 0;padding:1px 7px;border-radius:999px;background:#fff;color:#365b8f;font-size:12px}}[hidden]{{display:none!important}}
 @media(max-width:640px){{details{{margin-left:32px}}.topics:before{{left:12px}}details:before{{left:-20px;width:20px}}.chain{{padding-left:32px}}.chain:before{{left:16px}}.event:before{{left:-21px}}}}
-</style></head><body><header><h1>附件往来沟通链路</h1><p id="subtitle"></p></header>
+</style></head><body><header><h1>附件往来沟通链路</h1><p id="subtitle"></p></header>{warning}
 <div class="toolbar"><input id="search" type="search" placeholder="搜索事项、主题、参与人或附件"><button id="expand" type="button">展开全部</button><button id="collapse" type="button">折叠全部</button></div>
 <main><div class="root">目标附件事项总览</div><section class="topics" id="topics" aria-live="polite"></section></main>
 <script>const data={payload};const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));

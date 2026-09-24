@@ -9,7 +9,7 @@ from typing import Any
 from ..config import AppContext
 from ..modules.ai_client import AISettings, OpenAICompatibleClient
 from ..modules.html_report import write_mail_review, write_storyline_report
-from ..modules.imap_client import Imap126Client
+from ..modules.imap_client import FetchVolumeLimitError, Imap126Client
 from ..modules.mail_parser import matches_filters, parse_message
 from ..modules.mail_settings import MailSettings
 from ..modules.storage import ArchiveStore
@@ -18,6 +18,7 @@ from ..modules.threading import group_conversations
 
 logger = logging.getLogger(__name__)
 Progress = Callable[[str, int, int], None]
+PREVIEW_BYTES = 16 * 1024
 
 
 def check_login(ctx: AppContext) -> dict[str, Any]:
@@ -53,10 +54,24 @@ def _scan(ctx: AppContext, overrides: Mapping[str, Any] | None, *, save: bool, p
     seen = matched = saved = skipped_incremental = 0
     preview_rows: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
+    volume_limited = False
     with Imap126Client(settings) as client:
         for mailbox in settings.folders:
-            count, uidvalidity = client.select_mailbox(mailbox)
-            uids = client.search_uids(settings.since, settings.before, settings.max_messages_per_folder)
+            try:
+                count, uidvalidity = client.select_mailbox(mailbox)
+                uids, server_reasons = client.search_filtered_uids(
+                    settings.since,
+                    settings.before,
+                    settings.max_messages_per_folder,
+                    settings.senders,
+                    settings.recipients,
+                    settings.keywords,
+                    settings.match_mode,
+                )
+            except Exception as exc:
+                logger.exception("无法筛选邮箱文件夹：%s", mailbox)
+                errors.append({"mailbox": mailbox, "uid": "", "error": f"{type(exc).__name__}: {exc}"})
+                continue
             logger.info("扫描文件夹=%s 邮件总数=%s 搜索范围=%s", mailbox, count, len(uids))
             for index, uid in enumerate(uids, start=1):
                 key = store.state_key(settings.user, mailbox, uidvalidity, uid)
@@ -67,11 +82,12 @@ def _scan(ctx: AppContext, overrides: Mapping[str, Any] | None, *, save: bool, p
                 if progress:
                     progress(f"{mailbox} UID {uid}", index, len(uids))
                 try:
-                    raw = client.fetch_message(uid)
+                    raw = client.fetch_message_preview(uid, PREVIEW_BYTES)
                     if progress:
                         progress(f"{mailbox} UID {uid}", index, len(uids))
                     record = parse_message(raw, account=settings.user, mailbox=mailbox, uidvalidity=uidvalidity, uid=uid)
                     is_match, reasons = matches_filters(record, settings.senders, settings.recipients, settings.keywords, settings.match_mode)
+                    is_match, reasons = _merge_server_matches(is_match, reasons, server_reasons.get(uid, []), settings)
                     record["matched_by"] = reasons
                     preview_rows.append({
                         "uid": uid,
@@ -86,14 +102,37 @@ def _scan(ctx: AppContext, overrides: Mapping[str, Any] | None, *, save: bool, p
                     if is_match:
                         matched += 1
                     if save and is_match:
+                        raw = client.fetch_message(uid)
+                        record = parse_message(raw, account=settings.user, mailbox=mailbox, uidvalidity=uidvalidity, uid=uid)
+                        _matched, full_reasons = matches_filters(
+                            record,
+                            settings.senders,
+                            settings.recipients,
+                            settings.keywords,
+                            settings.match_mode,
+                        )
+                        _matched, reasons = _merge_server_matches(
+                            _matched,
+                            full_reasons,
+                            server_reasons.get(uid, []),
+                            settings,
+                        )
+                        record["matched_by"] = reasons
                         stored = store.save_message(raw, record)
                         saved += 1
                         store.mark(key, message_id=record["message_id"], content_sha256=record["content_sha256"], status="saved", filter_signature=settings.filter_signature, record_id=stored["record_id"])
                     elif save:
                         store.mark(key, message_id=record["message_id"], content_sha256=record["content_sha256"], status="not_matched", filter_signature=settings.filter_signature)
+                except FetchVolumeLimitError as exc:
+                    volume_limited = True
+                    logger.warning("扫描因 126 下载流量限制暂停：folder=%s uid=%s", mailbox, uid)
+                    errors.append({"mailbox": mailbox, "uid": uid, "error": f"{type(exc).__name__}: {exc}"})
+                    break
                 except Exception as exc:
                     logger.exception("邮件处理失败：folder=%s uid=%s", mailbox, uid)
                     errors.append({"mailbox": mailbox, "uid": uid, "error": f"{type(exc).__name__}: {exc}"})
+            if volume_limited:
+                break
     if save:
         store.flush()
         review_path = write_mail_review(store.records(), ctx.output_dir / "mail_review.html")
@@ -106,6 +145,8 @@ def _scan(ctx: AppContext, overrides: Mapping[str, Any] | None, *, save: bool, p
         "messages_saved": saved,
         "incremental_skipped": skipped_incremental,
         "errors": errors,
+        "incomplete": volume_limited,
+        "stop_reason": "126 IMAP FETCH 下载流量已达到阶段性上限" if volume_limited else "",
         "preview": preview_rows,
         "review_html": str(review_path) if review_path is not None else "",
     }
@@ -137,3 +178,24 @@ def analyze(ctx: AppContext) -> dict[str, Any]:
 def _mask(value: str) -> str:
     local, _, domain = value.partition("@")
     return f"{local[:2]}***@{domain}" if domain else "***"
+
+
+def _merge_server_matches(
+    local_match: bool,
+    local_reasons: list[str],
+    server_reasons: list[str],
+    settings: MailSettings,
+) -> tuple[bool, list[str]]:
+    reasons = list(dict.fromkeys([*local_reasons, *server_reasons]))
+    active = []
+    if settings.senders:
+        active.append("发件人")
+    if settings.recipients:
+        active.append("收件人/Cc")
+    if settings.keywords:
+        active.append("主题/正文关键词")
+    if not active:
+        return True, reasons
+    if settings.match_mode == "all":
+        return all(label in reasons for label in active), reasons
+    return local_match or any(label in reasons for label in active), reasons

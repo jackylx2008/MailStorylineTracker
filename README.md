@@ -55,8 +55,25 @@ MAIL_BEFORE=
 - `all`：所有已配置条件组都必须命中；组内多个值仍是任一值命中。
 - 未配置任何地址或关键词时，日期范围内邮件全部匹配。
 - `before` 遵循 IMAP 语义，不包含填写日期当天。
+- “每文件夹最多候选数”限制每个文件夹按 UID 从新到旧检查的数量。首次运行建议填 `50`，确认范围后再提高到 `100` 或 `200`。
 
 GUI 中的修改只影响当前运行，不会改写配置文件。
+
+### GUI 筛选字段怎么填
+
+- 邮箱文件夹：必须使用“列出文件夹”返回的精确名称，多个值用英文逗号分隔，例如 `INBOX,声学`。
+- 发件人地址/片段：可留空；多个值用英文逗号分隔，例如 `person@example.com,@supplier.com`。
+- 收件人/Cc 地址/片段：可留空；格式与发件人相同，同时检查 To 和 Cc。
+- 主题/正文关键词：多个关键词用英文逗号分隔，不需要引号，例如 `声学,浮筑,减震,噪声,振动`。
+- 起始日期：包含当天，格式必须为 `YYYY-MM-DD`。
+- 结束日期：不包含当天；留空表示直到当前邮件。分批扫描 2024 年时可填起始 `2024-01-01`、结束 `2025-01-01`。
+- 每文件夹最多候选数：首次建议 `50`；该值不是最终命中数，而是每个文件夹最多检查的最新候选邮件数。
+- 匹配方式 `any`：发件人、收件人/Cc、关键词任一组命中即可，适合扩大范围。
+- 匹配方式 `all`：所有填写过的条件组都必须命中；同一组中的多个值仍是任一值命中。
+
+“筛选预览”先在 126 服务器端筛日期、地址和主题，再只读取候选邮件开头 `16 KB` 检查正文，不下载附件，也不写入增量状态。“开始增量下载”才会对最终命中的邮件读取完整内容并归档。
+
+如果日志出现 `FETCH volume limit exceed`，表示 126 服务器已经对当前账号实施阶段性下载限制。程序会在第一次拒绝时立即停止并保存已有状态；客户端无法清除服务器额度，应等待额度恢复后从较小日期范围和候选数继续。不要在限流期间反复点击预览或下载。
 
 ## 目标附件沟通链路
 
@@ -73,6 +90,8 @@ Copy-Item target_file.env.example target_file.env
 - `target_email.env`：需要关注的邮件地址或地址片段，检查 From、To、Cc。
 - `target_keyword.env`：在主题、正文和附件名中查找的关键词。
 - `target_file.env`：每行是一个必须独立输出的附件事项；实际附件名由本地 AI 进行语义模糊匹配。
+
+GUI 的“目标附件链路”页会在启动时把三个文件的内容分别载入三个多行输入框作为默认值。可以在界面中临时增删内容后运行；界面修改只影响本次任务，不会覆盖本地 `target_*.env`。点击“从文件重新载入”可恢复文件中的当前内容。
 
 专项扫描采用：
 
@@ -117,7 +136,7 @@ AI_REMOTE_ENABLED=false
 python mail_storyline.py check-login
 python mail_storyline.py check-mail
 python mail_storyline.py list-folders
-python mail_storyline.py preview --senders example.com --keywords 项目,验收 --match-mode any
+python mail_storyline.py preview --senders example.com --keywords 项目,验收 --match-mode any --max-messages-per-folder 50
 python mail_storyline.py download
 python mail_storyline.py target-scan
 python mail_storyline.py check-ai
