@@ -88,6 +88,54 @@ class OpenAICompatibleClient:
         result["model"] = check["resolved_model"]
         return result
 
+    def match_attachment_names(self, filenames: list[str], targets: list[str]) -> dict[str, list[dict[str, Any]]]:
+        """只把附件名称交给模型，返回每个名称命中的独立目标事项。"""
+        unique_names = list(dict.fromkeys(name.strip() for name in filenames if name.strip()))
+        if not unique_names:
+            return {}
+        check = self.check()
+        prompt = (
+            "请对附件文件名和目标事项名称进行中文语义模糊匹配。允许文件名包含日期、版本号、回复、更新、"
+            "确认、审核、序号和扩展名，也允许同义表达；不能仅因都属于同一专业就判定匹配。"
+            "每个目标事项独立，一个附件可以匹配多个目标，但只返回有明确对应关系的结果。"
+            "不得读取或推断附件内容。只输出 JSON："
+            '{"matches":[{"filename":"原文件名","target":"目标事项原文","confidence":0.0,"reason":"简短依据"}]}。\n'
+            f"目标事项：{json.dumps(targets, ensure_ascii=False)}\n"
+            f"附件文件名：{json.dumps(unique_names, ensure_ascii=False)}"
+        )
+        payload = {
+            "model": check["resolved_model"],
+            "temperature": 0,
+            "max_tokens": self.settings.max_tokens,
+            "messages": [
+                {"role": "system", "content": "你是谨慎的中文文件名匹配器，只输出符合要求的 JSON。"},
+                {"role": "user", "content": prompt},
+            ],
+        }
+        response = self._request(f"{self.settings.base_url}/chat/completions", payload)
+        content = str(response["choices"][0]["message"].get("content", ""))
+        parsed = parse_json_response(content)
+        allowed_names = set(unique_names)
+        allowed_targets = set(targets)
+        result: dict[str, list[dict[str, Any]]] = {}
+        for item in parsed.get("matches", []):
+            if not isinstance(item, dict):
+                continue
+            filename = str(item.get("filename", ""))
+            target = str(item.get("target", ""))
+            if filename not in allowed_names or target not in allowed_targets:
+                continue
+            try:
+                confidence = max(0.0, min(1.0, float(item.get("confidence", 0))))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            if confidence < 0.55:
+                continue
+            result.setdefault(filename, []).append(
+                {"target": target, "confidence": confidence, "reason": str(item.get("reason", ""))}
+            )
+        return result
+
     def _request(self, url: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
         headers = {"Content-Type": "application/json"}

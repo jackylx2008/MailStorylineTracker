@@ -60,8 +60,8 @@ class ArchiveStore:
             source = {"account": record["account"], "mailbox": record["mailbox"], "uidvalidity": record["uidvalidity"], "uid": record["uid"]}
             if source not in sources:
                 sources.append(source)
-            existing["sources"] = sources
-            public = existing
+            public["sources"] = sources
+            self._records["records"][record["record_id"]] = public
         else:
             public["sources"] = [{"account": record["account"], "mailbox": record["mailbox"], "uidvalidity": record["uidvalidity"], "uid": record["uid"]}]
             self._records["records"][record["record_id"]] = public

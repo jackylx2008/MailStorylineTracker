@@ -11,6 +11,8 @@
 - 原始 `.eml`、附件、邮件结构化 JSON/JSONL 与 HTML 审核页。
 - 基于邮件回复头、规范化主题、参与人和时间接近度的会话归并。
 - 通过现有 OpenAI 兼容服务生成事项、参与人、状态、已完成、待办、责任人、截止日期、风险、来源及时间线。
+- 从本地 `target_email.env`、`target_keyword.env`、`target_file.env` 读取专项追踪范围，以联系人、关键词、AI 模糊附件名任一命中的方式扩大召回。
+- 将每个目标附件事项独立呈现在同一个可搜索、可展开折叠的思维导图式 HTML 中。
 - Tkinter GUI、CLI、共享日志、进度和安全取消。
 
 项目不会删除、移动、标记已读或修改服务器邮件。IMAP 文件夹始终以只读方式打开。
@@ -56,6 +58,38 @@ MAIL_BEFORE=
 
 GUI 中的修改只影响当前运行，不会改写配置文件。
 
+## 目标附件沟通链路
+
+复制三个脱敏模板并填写本地业务配置：
+
+```powershell
+Copy-Item target_email.env.example target_email.env
+Copy-Item target_keyword.env.example target_keyword.env
+Copy-Item target_file.env.example target_file.env
+```
+
+三个文件均采用“一行一个值”的格式：
+
+- `target_email.env`：需要关注的邮件地址或地址片段，检查 From、To、Cc。
+- `target_keyword.env`：在主题、正文和附件名中查找的关键词。
+- `target_file.env`：每行是一个必须独立输出的附件事项；实际附件名由本地 AI 进行语义模糊匹配。
+
+专项扫描采用：
+
+```text
+目标联系人命中 OR 目标关键词命中 OR 目标附件名命中
+```
+
+登录后会枚举并扫描账号下全部可选择的文件夹。附件 AI 只接收文件名，不读取附件正文。目标附件所在邮件作为时间线种子，再通过标准邮件回复头、规范化主题、参与人和时间关系补齐同一沟通链路。
+
+运行：
+
+```powershell
+python mail_storyline.py target-scan
+```
+
+详细规则见 [docs/TARGET_ATTACHMENT_TRACKING.md](docs/TARGET_ATTACHMENT_TRACKING.md)。
+
 ## AI 服务
 
 本项目只连接已经运行的 OpenAI 兼容服务，不负责启动或关闭 `llama-server`：
@@ -85,6 +119,7 @@ python mail_storyline.py check-mail
 python mail_storyline.py list-folders
 python mail_storyline.py preview --senders example.com --keywords 项目,验收 --match-mode any
 python mail_storyline.py download
+python mail_storyline.py target-scan
 python mail_storyline.py check-ai
 python mail_storyline.py analyze
 python mail_storyline.py all
@@ -117,12 +152,14 @@ output/
   mail_review.html                       邮件审核页
   storyline.json                         AI 结构化结果
   storyline.html                         可搜索的事项时间线
+  target_storylines.json                 目标附件沟通链路结构化数据
+  target_storylines.html                 思维导图式目标附件时间线
 logs/
   main.log
   mail_storyline.log
 ```
 
-这些目录包含私人邮件或运行信息，均不进入 Git。
+这些目录包含私人邮件或运行信息，均不进入 Git。真实 `target_*.env` 同样被忽略，仓库只跟踪脱敏的 `.example` 模板。
 
 ## 架构
 

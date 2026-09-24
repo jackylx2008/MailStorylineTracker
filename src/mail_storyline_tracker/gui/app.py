@@ -14,8 +14,10 @@ from tkinter import messagebox, ttk
 
 from ..config import AppContext
 from ..flows.mail_flow import analyze, check_ai, check_connection, download, list_folders, preview
+from ..flows.target_flow import scan_targets
 from ..modules.ai_client import AISettings
 from ..modules.mail_settings import MailSettings
+from ..modules.target_config import TargetCriteria
 
 
 class QueueHandler(logging.Handler):
@@ -60,6 +62,7 @@ class MailStorylineApp:
         notebook.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 5))
         self._build_search_tab(notebook)
         self._build_archive_tab(notebook)
+        self._build_target_tab(notebook)
         self._build_ai_tab(notebook)
         self._build_config_tab(notebook)
 
@@ -136,6 +139,26 @@ class MailStorylineApp:
         self._button(row, "检查 AI 服务", lambda: self._run("检查 AI 服务", lambda: check_ai(self.ctx))).pack(side="left", padx=4)
         self._button(row, "生成事项时间线", lambda: self._run("AI 梳理", lambda: analyze(self.ctx))).pack(side="left", padx=4)
         ttk.Button(row, text="打开时间线页面", command=lambda: self._open(self.ctx.output_dir / "storyline.html")).pack(side="left", padx=4)
+
+    def _build_target_tab(self, notebook: ttk.Notebook) -> None:
+        tab = ttk.Frame(notebook, padding=14)
+        notebook.add(tab, text="目标附件链路")
+        try:
+            criteria = TargetCriteria.load(self.ctx.project_root)
+            summary = f"目标联系人 {len(criteria.emails)} 个 · 关键词 {len(criteria.keywords)} 个 · 独立附件事项 {len(criteria.files)} 个"
+        except Exception as exc:
+            summary = f"目标配置尚未就绪：{exc}"
+        ttk.Label(tab, text=summary, wraplength=850).pack(anchor="w", pady=10)
+        ttk.Label(
+            tab,
+            text="扫描登录账号下全部可选择文件夹；联系人、关键词、附件名任一命中即归档。附件名由本地 AI 模糊匹配，不读取附件正文。",
+            wraplength=850,
+        ).pack(anchor="w", pady=5)
+        ttk.Label(tab, text=f"思维导图式结果：{self.ctx.output_dir / 'target_storylines.html'}").pack(anchor="w", pady=5)
+        row = ttk.Frame(tab)
+        row.pack(anchor="w", pady=18)
+        self._button(row, "扫描并生成沟通链路", lambda: self._run("目标附件链路", lambda: scan_targets(self.ctx, self._progress_callback))).pack(side="left", padx=4)
+        ttk.Button(row, text="打开沟通链路页面", command=lambda: self._open(self.ctx.output_dir / "target_storylines.html")).pack(side="left", padx=4)
 
     def _build_config_tab(self, notebook: ttk.Notebook) -> None:
         tab = ttk.Frame(notebook, padding=14)

@@ -6,6 +6,7 @@ __pycache__/
 .coverage
 .env
 common.env
+target_*.env
 logs/
 data/
 output/

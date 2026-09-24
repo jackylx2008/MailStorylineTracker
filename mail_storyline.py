@@ -11,10 +11,11 @@
   python mail_storyline.py list-folders
   python mail_storyline.py preview --senders example.com --keywords 项目,合同
   python mail_storyline.py download
+  python mail_storyline.py target-scan
   python mail_storyline.py analyze
 
 输出：
-  原始邮件和 JSON 状态写入 data/，审核与时间线页面写入 output/，日志写入 logs/。
+  原始邮件和 JSON 状态写入 data/，审核、目标附件沟通链路与时间线页面写入 output/，日志写入 logs/。
 """
 
 from __future__ import annotations
@@ -33,11 +34,12 @@ if str(SRC) not in sys.path:
 from logging_config import configure_utf8_stdio, setup_logger
 from mail_storyline_tracker.config import bootstrap
 from mail_storyline_tracker.flows.mail_flow import analyze, check_ai, check_connection, check_login, download, list_folders, preview
+from mail_storyline_tracker.flows.target_flow import scan_targets
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("action", choices=("check-login", "check-mail", "list-folders", "preview", "download", "check-ai", "analyze", "all"))
+    parser.add_argument("action", choices=("check-login", "check-mail", "list-folders", "preview", "download", "target-scan", "check-ai", "analyze", "all"))
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--folders", help="逗号分隔的邮箱文件夹")
     parser.add_argument("--senders", help="逗号分隔的发件人地址或片段")
@@ -65,12 +67,14 @@ def main() -> int:
         result = preview(ctx, overrides)
     elif args.action == "download":
         result = download(ctx, overrides)
+    elif args.action == "target-scan":
+        result = scan_targets(ctx)
     elif args.action == "check-ai":
         result = check_ai(ctx)
     elif args.action == "analyze":
         result = analyze(ctx)
     else:
-        result = {"download": download(ctx, overrides), "analysis": analyze(ctx)}
+        result = {"target_scan": scan_targets(ctx), "analysis": analyze(ctx)}
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
