@@ -6,17 +6,22 @@ import queue
 import threading
 import time
 import webbrowser
+from concurrent.futures import CancelledError
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote
 
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 
 from ..config import AppContext
 from ..flows.mail_flow import analyze, check_ai, check_connection, download, list_folders, preview
-from ..flows.target_flow import scan_targets
+from ..flows.target_flow import generate_target_report, scan_targets
 from ..modules.ai_client import AISettings
+from ..modules.html_report import write_mail_review
 from ..modules.mail_settings import MailSettings
+from ..modules.review_service import ReviewService
+from ..modules.storage import ArchiveStore
 from ..modules.target_config import TargetCriteria
 
 
@@ -41,6 +46,7 @@ class MailStorylineApp:
         self.variables: dict[str, tk.Variable] = {}
         self.target_inputs: dict[str, scrolledtext.ScrolledText] = {}
         self.action_buttons: list[ttk.Button] = []
+        self.review_service: ReviewService | None = None
         self.status = tk.StringVar(value="就绪")
         self.current = tk.StringVar(value="")
         self.elapsed = tk.StringVar(value="00:00:00")
@@ -48,6 +54,7 @@ class MailStorylineApp:
         self._configure_window()
         self._build()
         self._attach_logging()
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.root.after(100, self._poll)
 
     def _configure_window(self) -> None:
@@ -63,7 +70,6 @@ class MailStorylineApp:
         notebook.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 5))
         self._build_search_tab(notebook)
         self._build_archive_tab(notebook)
-        self._build_target_tab(notebook)
         self._build_ai_tab(notebook)
         self._build_config_tab(notebook)
 
@@ -89,39 +95,60 @@ class MailStorylineApp:
         self.cancel_button.grid(row=1, column=3, sticky="e")
 
     def _build_search_tab(self, notebook: ttk.Notebook) -> None:
-        tab = ttk.Frame(notebook, padding=14)
+        tab = ttk.Frame(notebook)
         notebook.add(tab, text="邮箱连接与筛选")
+        tab.rowconfigure(0, weight=1)
+        tab.columnconfigure(0, weight=1)
+        canvas = tk.Canvas(tab, borderwidth=0, highlightthickness=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        content = ttk.Frame(canvas, padding=14)
+        window = canvas.create_window((0, 0), window=content, anchor="nw")
+        content.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
+        content.columnconfigure(0, weight=1)
+        form = ttk.LabelFrame(content, text="邮箱连接与常规筛选", padding=8)
+        form.grid(row=0, column=0, sticky="ew")
         settings = MailSettings.from_config(self.ctx.config)
+        try:
+            target_defaults = TargetCriteria.load(self.ctx.project_root)
+        except (FileNotFoundError, ValueError):
+            target_defaults = TargetCriteria((), (), ())
         fields = (
             ("folders", "邮箱文件夹（逗号分隔）", ",".join(settings.folders)),
-            ("senders", "发件人地址/片段", ",".join(settings.senders)),
-            ("recipients", "收件人/Cc 地址/片段", ",".join(settings.recipients)),
-            ("keywords", "主题/正文关键词", ",".join(settings.keywords)),
+            ("senders", "发件人地址/片段", ",".join(settings.senders or target_defaults.emails)),
+            ("recipients", "收件人/Cc 地址/片段", ",".join(settings.recipients or target_defaults.emails)),
+            ("keywords", "主题/正文关键词", ",".join(settings.keywords or target_defaults.keywords)),
             ("since", "起始日期", settings.since),
             ("before", "结束日期（不含，可留空）", settings.before),
             ("max_messages_per_folder", "每文件夹最多候选数", str(settings.max_messages_per_folder)),
         )
         for row, (key, label, default) in enumerate(fields):
-            ttk.Label(tab, text=label).grid(row=row, column=0, sticky="w", padx=5, pady=6)
+            ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", padx=5, pady=6)
             variable = tk.StringVar(value=default)
             self.variables[key] = variable
-            ttk.Entry(tab, textvariable=variable).grid(row=row, column=1, sticky="ew", padx=5, pady=6)
-        ttk.Label(tab, text="匹配方式").grid(row=7, column=0, sticky="w", padx=5, pady=6)
+            ttk.Entry(form, textvariable=variable).grid(row=row, column=1, sticky="ew", padx=5, pady=6)
+        ttk.Label(form, text="匹配方式").grid(row=7, column=0, sticky="w", padx=5, pady=6)
         mode = tk.StringVar(value=settings.match_mode)
         self.variables["match_mode"] = mode
-        ttk.Combobox(tab, textvariable=mode, values=("any", "all"), state="readonly").grid(row=7, column=1, sticky="ew", padx=5, pady=6)
-        tab.columnconfigure(1, weight=1)
-        buttons = ttk.Frame(tab)
+        ttk.Combobox(form, textvariable=mode, values=("any", "all"), state="readonly").grid(row=7, column=1, sticky="ew", padx=5, pady=6)
+        form.columnconfigure(1, weight=1)
+        buttons = ttk.Frame(form)
         buttons.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(14, 5))
         self._button(buttons, "检查连接", lambda: self._run("检查邮箱连接", lambda: check_connection(self.ctx, self._overrides()))).pack(side="left", padx=4)
         self._button(buttons, "列出文件夹", lambda: self._run("读取邮箱文件夹", lambda: {"folders": list_folders(self.ctx)})).pack(side="left", padx=4)
         self._button(buttons, "筛选预览", lambda: self._run("筛选预览", lambda: preview(self.ctx, self._overrides(), self._progress_callback))).pack(side="left", padx=4)
         ttk.Label(
-            tab,
+            form,
             text="文件夹名必须与“列出文件夹”的结果完全一致；预览会先筛日期、地址和主题，只读取候选邮件前 16 KB，不下载附件。",
             foreground="#555555",
             wraplength=900,
         ).grid(row=9, column=0, columnspan=2, sticky="w", padx=5, pady=6)
+        target_section = ttk.LabelFrame(content, text="目标联系人、关键词与附件事项", padding=10)
+        target_section.grid(row=1, column=0, sticky="ew", pady=(14, 6))
+        self._build_target_section(target_section)
 
     def _build_archive_tab(self, notebook: ttk.Notebook) -> None:
         tab = ttk.Frame(notebook, padding=14)
@@ -132,7 +159,7 @@ class MailStorylineApp:
         row = ttk.Frame(tab)
         row.pack(anchor="w", pady=18)
         self._button(row, "开始增量下载", lambda: self._run("增量下载", lambda: download(self.ctx, self._overrides(), self._progress_callback))).pack(side="left", padx=4)
-        ttk.Button(row, text="打开邮件审核页", command=lambda: self._open(self.ctx.output_dir / "mail_review.html")).pack(side="left", padx=4)
+        ttk.Button(row, text="打开邮件审核页", command=self._open_review).pack(side="left", padx=4)
 
     def _build_ai_tab(self, notebook: ttk.Notebook) -> None:
         tab = ttk.Frame(notebook, padding=14)
@@ -148,9 +175,7 @@ class MailStorylineApp:
         self._button(row, "生成事项时间线", lambda: self._run("AI 梳理", lambda: analyze(self.ctx))).pack(side="left", padx=4)
         ttk.Button(row, text="打开时间线页面", command=lambda: self._open(self.ctx.output_dir / "storyline.html")).pack(side="left", padx=4)
 
-    def _build_target_tab(self, notebook: ttk.Notebook) -> None:
-        tab = ttk.Frame(notebook, padding=14)
-        notebook.add(tab, text="目标附件链路")
+    def _build_target_section(self, tab: ttk.LabelFrame) -> None:
         try:
             criteria = TargetCriteria.load(self.ctx.project_root)
             summary = f"目标联系人 {len(criteria.emails)} 个 · 关键词 {len(criteria.keywords)} 个 · 独立附件事项 {len(criteria.files)} 个"
@@ -160,7 +185,7 @@ class MailStorylineApp:
         ttk.Label(tab, text=summary, wraplength=850).pack(anchor="w", pady=10)
         ttk.Label(
             tab,
-            text="以下内容默认读取 target_*.env；每行一个值。可在本次运行前编辑，界面修改不会写回文件。联系人、关键词、附件名任一命中即归档。",
+            text="以下内容默认读取 target_*.env，每行一个值；联系人、关键词、附件名任一命中即归档。专项扫描使用上方日期与候选数，并枚举全部可选择文件夹。上方常规预览/下载需要这些联系人和关键词时，点击“应用目标条件到常规筛选”；附件事项由专项扫描使用本地 AI 模糊匹配。界面修改不会写回文件。",
             wraplength=850,
         ).pack(anchor="w", pady=5)
         editors = ttk.Frame(tab)
@@ -173,16 +198,17 @@ class MailStorylineApp:
         for column, (key, title, values) in enumerate(definitions):
             box = ttk.LabelFrame(editors, text=title, padding=5)
             box.grid(row=0, column=column, sticky="nsew", padx=4)
-            editor = scrolledtext.ScrolledText(box, height=11, wrap="word", font=("Microsoft YaHei UI", 10))
+            editor = scrolledtext.ScrolledText(box, height=7, wrap="word", font=("Microsoft YaHei UI", 10))
             editor.pack(fill="both", expand=True)
             editor.insert("1.0", "\n".join(values))
             self.target_inputs[key] = editor
             editors.columnconfigure(column, weight=1)
         editors.rowconfigure(0, weight=1)
-        ttk.Label(tab, text=f"思维导图式结果：{self.ctx.output_dir / 'target_storylines.html'}").pack(anchor="w", pady=5)
+        ttk.Label(tab, text=f"节点连线式结果：{self.ctx.output_dir / 'target_storylines.html'}").pack(anchor="w", pady=5)
         row = ttk.Frame(tab)
         row.pack(anchor="w", pady=8)
         self._button(row, "扫描并生成沟通链路", self._start_target_scan).pack(side="left", padx=4)
+        ttk.Button(row, text="应用目标条件到常规筛选", command=self._apply_targets_to_search).pack(side="left", padx=4)
         ttk.Button(row, text="从文件重新载入", command=self._reload_target_defaults).pack(side="left", padx=4)
         ttk.Button(row, text="打开沟通链路页面", command=lambda: self._open(self.ctx.output_dir / "target_storylines.html")).pack(side="left", padx=4)
 
@@ -194,8 +220,28 @@ class MailStorylineApp:
             return
         self._run(
             "目标附件链路",
-            lambda: scan_targets(self.ctx, self._progress_callback, criteria),
+            lambda: scan_targets(
+                self.ctx,
+                self._progress_callback,
+                criteria,
+                {key: self.variables[key].get() for key in ("since", "before", "max_messages_per_folder")},
+            ),
         )
+
+    def _apply_targets_to_search(self) -> None:
+        try:
+            criteria = self._target_criteria()
+        except Exception as exc:
+            messagebox.showerror("目标配置错误", str(exc))
+            return
+        for key, additions in (("senders", criteria.emails), ("recipients", criteria.emails), ("keywords", criteria.keywords)):
+            values = [value.strip() for value in self.variables[key].get().split(",") if value.strip()]
+            seen = {value.casefold() for value in values}
+            for value in additions:
+                if value.casefold() not in seen:
+                    values.append(value)
+                    seen.add(value.casefold())
+            self.variables[key].set(",".join(values))
 
     def _target_criteria(self) -> TargetCriteria:
         return TargetCriteria.from_values(
@@ -237,7 +283,7 @@ class MailStorylineApp:
 
     def _progress_callback(self, label: str, done: int, total: int) -> None:
         if self.cancel_event.is_set():
-            raise RuntimeError("任务已取消")
+            raise CancelledError("任务已取消")
         self.events.put(("progress", (label, done, total)))
 
     def _run(self, title: str, operation: Callable[[], Any]) -> None:
@@ -254,6 +300,8 @@ class MailStorylineApp:
         def target() -> None:
             try:
                 self.events.put(("result", operation()))
+            except CancelledError:
+                self.events.put(("cancelled", "任务已取消；已完成的进度保留。"))
             except Exception as exc:
                 self.events.put(("error", f"{type(exc).__name__}: {exc}"))
             finally:
@@ -285,12 +333,17 @@ class MailStorylineApp:
                 elif kind == "result":
                     self._append_log(json.dumps(payload, ensure_ascii=False, indent=2)[:12000])
                     if isinstance(payload, dict):
+                        summary = payload.get("summary")
+                        if payload.get("cancelled") or (isinstance(summary, dict) and summary.get("cancelled")):
+                            self.status.set("已取消")
                         self.last_html = str(payload.get("html") or payload.get("review_html") or "")
-                elif kind == "error":
-                    self.status.set("已取消" if "任务已取消" in str(payload) else "失败")
+                elif kind == "cancelled":
+                    self.status.set("已取消")
                     self._append_log(str(payload))
-                    if "任务已取消" not in str(payload):
-                        messagebox.showerror("任务失败", str(payload))
+                elif kind == "error":
+                    self.status.set("失败")
+                    self._append_log(str(payload))
+                    messagebox.showerror("任务失败", str(payload))
                 elif kind == "finished":
                     if self.status.get() not in {"失败", "已取消"}:
                         self.status.set("完成")
@@ -327,6 +380,36 @@ class MailStorylineApp:
             messagebox.showinfo("文件不存在", f"尚未生成：{path}")
             return
         webbrowser.open(path.resolve().as_uri())
+
+    def _open_review(self) -> None:
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("任务运行中", "请在当前任务完成后打开邮件审核页。")
+            return
+        try:
+            records = ArchiveStore(self.ctx.data_dir).reviewed_records()
+            path = write_mail_review(records, self.ctx.output_dir / "mail_review.html")
+            if self.review_service is None:
+                self.review_service = ReviewService(self.ctx.data_dir, self._refresh_reviewed_storylines)
+        except Exception as exc:
+            messagebox.showerror("审核页生成失败", str(exc))
+            return
+        webbrowser.open(f"{path.resolve().as_uri()}?review_api={quote(self.review_service.url, safe='')}")
+
+    def _refresh_reviewed_storylines(self) -> None:
+        write_mail_review(
+            ArchiveStore(self.ctx.data_dir).reviewed_records(),
+            self.ctx.output_dir / "mail_review.html",
+        )
+        generate_target_report(
+            self.ctx,
+            TargetCriteria.load(self.ctx.project_root),
+            {"local_only": True, "incomplete": True, "stop_reason": "基于当前本地归档及人工审核结果重建"},
+        )
+
+    def _close(self) -> None:
+        if self.review_service is not None:
+            self.review_service.close()
+        self.root.destroy()
 
 
 def run(root: tk.Tk, ctx: AppContext) -> None:

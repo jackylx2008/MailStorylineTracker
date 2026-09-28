@@ -15,10 +15,13 @@ class ArchiveStore:
         self.data_dir = data_dir
         self.raw_dir = data_dir / "raw_mail"
         self.state_path = data_dir / "state" / "mail_sync_state.json"
+        self.review_state_path = data_dir / "state" / "review_exclusions.json"
         self.records_path = data_dir / "records" / "mail_records.json"
         self._state = _read_json(self.state_path, {"version": 1, "items": {}})
         self._state.setdefault("fetch_limits", {})
         self._records = _read_json(self.records_path, {"version": 1, "records": {}})
+        self._review_state = _read_json(self.review_state_path, {"version": 1, "excluded_record_ids": []})
+        self._excluded_source_keys = self._review_excluded_source_keys()
 
     @staticmethod
     def state_key(account: str, mailbox: str, uidvalidity: str, uid: str) -> str:
@@ -27,6 +30,27 @@ class ArchiveStore:
     def is_processed(self, key: str, filter_signature: str) -> bool:
         item = self._state["items"].get(key, {})
         return item.get("filter_signature") == filter_signature and item.get("status") in {"saved", "not_matched"}
+
+    def is_review_excluded_source(self, key: str) -> bool:
+        """在 FETCH 前跳过已审核排除的已知服务器来源，不受筛选签名变化影响。"""
+        item = self._state["items"].get(key, {})
+        return key in self._excluded_source_keys or item.get("record_id") in self.excluded_record_ids()
+
+    def is_review_excluded_record(self, record_id: str) -> bool:
+        return record_id in self.excluded_record_ids()
+
+    def _review_excluded_source_keys(self) -> set[str]:
+        keys = set()
+        for record_id in self.excluded_record_ids():
+            record = self._records["records"].get(record_id, {})
+            for source in record.get("sources", []):
+                keys.add(self.state_key(
+                    str(source.get("account", "")),
+                    str(source.get("mailbox", "")),
+                    str(source.get("uidvalidity", "")),
+                    str(source.get("uid", "")),
+                ))
+        return keys
 
     def partial_record(self, key: str, filter_signature: str) -> dict[str, Any] | None:
         """返回已命中但尚未完整下载的记录，用于断点升级完整 EML 和附件。"""
@@ -126,10 +150,31 @@ class ArchiveStore:
         else:
             public["sources"] = [{"account": record["account"], "mailbox": record["mailbox"], "uidvalidity": record["uidvalidity"], "uid": record["uid"]}]
             self._records["records"][record["record_id"]] = public
+        if record["record_id"] in self.excluded_record_ids():
+            self._excluded_source_keys = self._review_excluded_source_keys()
         return public
 
     def records(self) -> list[dict[str, Any]]:
         return sorted(self._records["records"].values(), key=lambda item: item.get("sent_at", ""))
+
+    def excluded_record_ids(self) -> set[str]:
+        return set(self._review_state.get("excluded_record_ids", []))
+
+    def reviewed_records(self) -> list[dict[str, Any]]:
+        excluded = self.excluded_record_ids()
+        return [record for record in self.records() if str(record.get("record_id", "")) not in excluded]
+
+    def update_review_exclusions(self, record_ids: set[str], *, excluded: bool) -> set[str]:
+        unknown = record_ids - self._records["records"].keys()
+        if unknown:
+            raise KeyError(f"审核记录不存在：{len(unknown)} 条")
+        current = self.excluded_record_ids()
+        updated = current | record_ids if excluded else current - record_ids
+        if updated != current:
+            self._review_state["excluded_record_ids"] = sorted(updated)
+            _write_json_atomic(self.review_state_path, self._review_state)
+            self._excluded_source_keys = self._review_excluded_source_keys()
+        return updated
 
     def update_record_metadata(self, record_id: str, **values: Any) -> None:
         record = self._records["records"].get(record_id)

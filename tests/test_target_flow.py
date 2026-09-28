@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
+from concurrent.futures import CancelledError
 from email.message import EmailMessage
 from pathlib import Path
 from unittest.mock import patch
 
+from mail_storyline_tracker.config import AppContext
 from mail_storyline_tracker.modules.ai_client import AISettings, OpenAICompatibleClient
 from mail_storyline_tracker.modules.html_report import write_target_mindmap
 from mail_storyline_tracker.modules.mail_parser import parse_message
 from mail_storyline_tracker.modules.storage import ArchiveStore
 from mail_storyline_tracker.modules.target_config import TargetCriteria
-from mail_storyline_tracker.flows.target_flow import _process_batch, build_target_storylines
+from mail_storyline_tracker.flows.target_flow import _process_batch, build_target_storylines, generate_target_report, scan_targets
+from mail_storyline_tracker.modules.imap_client import MailboxInfo
 
 
 def _record(record_id: str, message_id: str, subject: str, sent_at: str, *, target: str = "", reference: str = "") -> dict:
@@ -37,6 +41,125 @@ def _record(record_id: str, message_id: str, subject: str, sent_at: str, *, targ
 
 
 class TargetFlowTests(unittest.TestCase):
+    def test_target_scan_user_cancel_does_not_fetch_or_log_error(self) -> None:
+        class FakeClient:
+            def __init__(self, settings) -> None:
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def list_mailboxes(self):
+                return [MailboxInfo("INBOX", (), "/")]
+
+            def select_mailbox(self, mailbox):
+                return 1, "7"
+
+            def search_uids(self, since, before, maximum):
+                return ["8"]
+
+            def fetch_message_preview(self, uid, max_bytes):
+                raise AssertionError("取消后不应预览 FETCH")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ctx = AppContext(root, {
+                "app": {"data_dir": "data", "output_dir": "output"},
+                "mail": {"imap": {"user": "demo@126.com", "password": "secret"}},
+            })
+
+            def cancel(_label: str, _done: int, _total: int) -> None:
+                raise CancelledError("任务已取消")
+
+            with patch("mail_storyline_tracker.flows.target_flow.Imap126Client", FakeClient), patch(
+                "mail_storyline_tracker.flows.target_flow.OpenAICompatibleClient"
+            ), patch("mail_storyline_tracker.flows.target_flow.logger.exception") as log_exception:
+                result = scan_targets(ctx, progress=cancel, criteria=TargetCriteria(("alice@example.com",), (), ()))
+            self.assertTrue(result["summary"]["cancelled"])
+            self.assertTrue(result["summary"]["incomplete"])
+            self.assertEqual(result["summary"]["errors"], 0)
+            log_exception.assert_not_called()
+
+    def test_target_scan_skips_review_excluded_source_before_fetch(self) -> None:
+        message = EmailMessage()
+        message["From"] = "alice@example.com"
+        message["To"] = "team@example.com"
+        message["Message-ID"] = "<excluded-target@example.com>"
+        message.set_content("请审核。")
+        raw = message.as_bytes()
+
+        class FakeClient:
+            def __init__(self, settings) -> None:
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def list_mailboxes(self):
+                return [MailboxInfo("INBOX", (), "/")]
+
+            def select_mailbox(self, mailbox):
+                return 1, "7"
+
+            def search_uids(self, since, before, maximum):
+                return ["8"]
+
+            def fetch_message_preview(self, uid, max_bytes):
+                raise AssertionError("已排除邮件不应预览 FETCH")
+
+            def fetch_message(self, uid):
+                raise AssertionError("已排除邮件不应完整 FETCH")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ctx = AppContext(root, {
+                "app": {"data_dir": "data", "output_dir": "output"},
+                "mail": {"imap": {"user": "demo@126.com", "password": "secret"}},
+            })
+            store = ArchiveStore(ctx.data_dir)
+            record = parse_message(raw, account="demo@126.com", mailbox="INBOX", uidvalidity="7", uid="8")
+            stored = store.save_message(raw, record)
+            store.flush()
+            store.update_review_exclusions({stored["record_id"]}, excluded=True)
+            with patch("mail_storyline_tracker.flows.target_flow.Imap126Client", FakeClient), patch(
+                "mail_storyline_tracker.flows.target_flow.OpenAICompatibleClient"
+            ) as ai_client:
+                result = scan_targets(ctx, criteria=TargetCriteria(("alice@example.com",), (), ()))
+            ai_client.return_value.check.assert_called_once()
+            self.assertEqual(result["summary"]["review_excluded_skipped"], 1)
+
+    def test_excluded_mail_does_not_appear_in_regenerated_target_chain(self) -> None:
+        message = EmailMessage()
+        message["From"] = "alice@example.com"
+        message["To"] = "team@example.com"
+        message["Subject"] = "示例审核资料"
+        message["Message-ID"] = "<target-review@example.com>"
+        message.set_content("请审核附件。")
+        message.add_attachment(b"example", maintype="application", subtype="pdf", filename="review.pdf")
+        raw = message.as_bytes()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ctx = AppContext(root, {"app": {"data_dir": "data", "output_dir": "output"}})
+            store = ArchiveStore(ctx.data_dir)
+            record = parse_message(raw, account="demo@126.com", mailbox="INBOX", uidvalidity="1", uid="8")
+            criteria = TargetCriteria((), (), ("示例审核资料",))
+            record["target_matches"] = [{"target": "示例审核资料", "filename": "review.pdf"}]
+            stored = store.save_message(raw, record)
+            store.flush()
+            generate_target_report(ctx, criteria)
+            before = json.loads((ctx.output_dir / "target_storylines.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(before["targets"][0]["events"]), 1)
+            store.update_review_exclusions({stored["record_id"]}, excluded=True)
+            generate_target_report(ctx, criteria)
+            after = json.loads((ctx.output_dir / "target_storylines.json").read_text(encoding="utf-8"))
+            self.assertEqual(after["targets"][0]["events"], [])
+
     def test_matched_target_downloads_full_eml_and_attachment_once(self) -> None:
         message = EmailMessage()
         message["From"] = "Alice <alice@example.com>"

@@ -19,15 +19,131 @@ h2{margin:0 0 8px;font-size:20px}h3{font-size:15px;margin:16px 0 5px}.timeline{b
 def write_mail_review(records: list[dict[str, Any]], path: Path) -> Path:
     cards = []
     for record in sorted(records, key=lambda item: item.get("sent_at", ""), reverse=True):
-        body = html.escape(str(record.get("body_text", ""))[:3000])
+        body_text = str(record.get("body_text", ""))
+        body = html.escape(body_text[:3000])
         attachments = "、".join(html.escape(str(item.get("filename", ""))) for item in record.get("attachments", [])) or "无"
-        cards.append(
-            f'''<article class="card searchable"><h2>{html.escape(str(record.get("subject") or "（无主题）"))}</h2>
-            <div class="meta">{html.escape(str(record.get("sent_at", "")))} · {html.escape(str(record.get("from", "")))} → {html.escape(str(record.get("to", "")))}</div>
-            <p>命中：{html.escape("、".join(record.get("matched_by", [])))}</p><p>附件：{attachments}</p>
-            <details><summary>正文摘录与来源</summary><pre>{body}</pre><code>{html.escape(str(record.get("eml_path", "")))}</code></details></article>'''
+        email_text = " ".join(
+            [str(record.get(name, "")) for name in ("from", "to", "cc")]
+            + [str(address) for values in record.get("addresses", {}).values() for address in values]
         )
-    return _write_page(path, "邮件下载审核", f"共存档 {len(records)} 封匹配邮件", "".join(cards))
+        keyword_text = " ".join(
+            [str(record.get("subject", "")), body_text]
+            + [str(item.get("filename", "")) for item in record.get("attachments", [])]
+        )
+        record_id = html.escape(str(record.get("record_id", "")), quote=True)
+        email_index = html.escape(email_text, quote=True)
+        keyword_index = html.escape(keyword_text, quote=True)
+        cc = f' · Cc: {html.escape(str(record["cc"]))}' if record.get("cc") else ""
+        cards.append(
+            f'''<article class="card review-item" data-record-id="{record_id}" data-email="{email_index}" data-keywords="{keyword_index}"><h2>{html.escape(str(record.get("subject") or "（无主题）"))}</h2>
+            <div class="meta">{html.escape(str(record.get("sent_at", "")))} · {html.escape(str(record.get("from", "")))} → {html.escape(str(record.get("to", "")))}{cc}</div>
+            <p>命中：{html.escape("、".join(record.get("matched_by", [])))}</p><p>附件：{attachments}</p>
+            <details><summary>正文摘录与来源</summary><pre>{body}</pre><code>{html.escape(str(record.get("eml_path", "")))}</code></details>
+            <div class="review-actions"><button type="button" class="delete-review" aria-label="从审核页删除此条目">删除条目</button></div></article>'''
+        )
+    return _write_review_page(path, len(records), "".join(cards))
+
+
+REVIEW_STYLE = """
+.review-toolbar{display:grid;grid-template-columns:repeat(2,minmax(220px,1fr));gap:12px}
+.review-toolbar label{display:block;font-size:13px;color:var(--muted);font-weight:600}
+.review-toolbar input{display:block;margin-top:4px}.review-summary{grid-column:1/-1;color:var(--muted);font-size:13px}
+.review-actions{display:flex;justify-content:flex-end;margin-top:14px;padding-top:10px;border-top:1px solid var(--line)}
+.delete-review,#undo-delete{padding:6px 11px;border:1px solid #b8c3d3;border-radius:7px;background:#fff;color:#9b302b;cursor:pointer;font:inherit}
+.delete-review:hover,#undo-delete:hover{background:#fff0ee}#undo-delete{color:var(--ink);margin-left:8px}
+pre{white-space:pre-wrap;overflow-wrap:anywhere}code{overflow-wrap:anywhere}.empty-review{padding:18px;color:var(--muted)}
+@media(max-width:640px){.review-toolbar{grid-template-columns:1fr}}
+"""
+
+
+REVIEW_SCRIPT = """
+const cards=[...document.querySelectorAll('.review-item')];
+const emailFilter=document.getElementById('email-filter');
+const keywordFilter=document.getElementById('keyword-filter');
+const summary=document.getElementById('review-summary');
+const syncStatus=document.getElementById('review-sync-status');
+const empty=document.getElementById('empty-review');
+const undo=document.getElementById('undo-delete');
+const apiUrl=new URLSearchParams(location.search).get('review_api');
+const storageKey='mail-storyline-review-deleted-v1:'+location.pathname;
+let storageAvailable=true;
+let deleted;
+try{deleted=new Set(JSON.parse(localStorage.getItem(storageKey)||'[]'));}
+catch(error){deleted=new Set();storageAvailable=false;}
+let lastDeleted='';
+let apiReady=false;
+const terms=value=>value.toLocaleLowerCase().split(/[,，;；]+/).map(x=>x.trim()).filter(Boolean);
+const matches=(text,values)=>!values.length||values.some(value=>text.toLocaleLowerCase().includes(value));
+function saveDeleted(){
+  if(!storageAvailable)return;
+  try{localStorage.setItem(storageKey,JSON.stringify([...deleted]));}
+  catch(error){storageAvailable=false;}
+}
+function update(){
+  const emails=terms(emailFilter.value),keywords=terms(keywordFilter.value);
+  let shown=0;
+  cards.forEach(card=>{
+    const isDeleted=deleted.has(card.dataset.recordId);
+    card.hidden=isDeleted||!matches(card.dataset.email||'',emails)||!matches(card.dataset.keywords||'',keywords);
+    if(!card.hidden)shown++;
+  });
+  summary.textContent=`显示 ${shown} / ${cards.length} 封 · 已排除 ${deleted.size} 封`;
+  empty.hidden=shown!==0;
+  undo.hidden=!lastDeleted||!apiReady;
+}
+async function sendDecision(action,recordIds){
+  const response=await fetch(apiUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,record_ids:recordIds})});
+  const result=await response.json();
+  if(!response.ok)throw new Error(result.error||'审核状态保存失败');
+  deleted=new Set(result.excluded_record_ids);
+  saveDeleted();update();
+  return result;
+}
+document.querySelectorAll('.delete-review').forEach(button=>button.addEventListener('click',async()=>{
+  const card=button.closest('.review-item');
+  button.disabled=true;
+  try{
+    const result=await sendDecision('exclude',[card.dataset.recordId]);
+    lastDeleted=card.dataset.recordId;
+    syncStatus.textContent=result.report_error?'排除已保存，但故事线重建失败；请重新生成报告。':'审核决定已保存到本地项目，后续故事线将跳过该邮件。';
+    update();
+  }catch(error){syncStatus.textContent=`保存失败：${error.message}`;}
+  finally{button.disabled=false;}
+}));
+undo.addEventListener('click',async()=>{
+  undo.disabled=true;
+  try{const result=await sendDecision('restore',[lastDeleted]);lastDeleted='';syncStatus.textContent=result.report_error?'恢复已保存，但故事线重建失败；请重新生成报告。':'已恢复审核条目及后续故事线。';update();}
+  catch(error){syncStatus.textContent=`恢复失败：${error.message}`;}
+  finally{undo.disabled=false;}
+});
+emailFilter.addEventListener('input',update);
+keywordFilter.addEventListener('input',update);
+document.querySelectorAll('.delete-review').forEach(button=>button.disabled=true);
+update();
+if(apiUrl){
+  sendDecision('merge',[...deleted]).then(result=>{
+    apiReady=true;
+    document.querySelectorAll('.delete-review').forEach(button=>button.disabled=false);
+    syncStatus.textContent=result.report_error?'审核决定已同步，但故事线重建失败；请重新生成报告。':`审核决定已与本地项目同步，共排除 ${deleted.size} 封邮件。`;
+    update();
+  }).catch(error=>{syncStatus.textContent=`审核状态同步失败：${error.message}；请从 GUI 重新打开审核页。`;});
+}else{syncStatus.textContent='请从项目 GUI 打开审核页，才能将删除决定同步到后续故事线。';}
+"""
+
+
+def _write_review_page(path: Path, count: int, cards: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    document = f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>邮件下载审核</title><style>{STYLE}{REVIEW_STYLE}</style></head><body>
+    <header><h1>邮件下载审核</h1><p>审核清单含 {count} 封邮件</p></header>
+    <main><div class="toolbar review-toolbar">
+    <label>邮箱筛选（From / To / Cc）<input id="email-filter" type="search" placeholder="输入邮箱地址或片段；多个值用逗号分隔"></label>
+    <label>关键词筛选（主题 / 正文 / 附件名）<input id="keyword-filter" type="search" placeholder="输入关键词；多个值用逗号分隔"></label>
+    <div class="review-summary"><span id="review-summary"></span><button type="button" id="undo-delete" hidden>撤销上次删除</button><br><span id="review-sync-status" role="status"></span><br>删除条目会写入本地审核排除记录，后续故事线不再包含该邮件；原始邮件、附件和服务器邮件仍保留。</div>
+    </div>{cards}<div id="empty-review" class="card empty-review" hidden>没有符合当前筛选条件的邮件。</div></main>
+    <script>{REVIEW_SCRIPT}</script></body></html>'''
+    path.write_text(document, encoding="utf-8")
+    return path
 
 
 def write_storyline_report(result: dict[str, Any], path: Path) -> Path:

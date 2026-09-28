@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable, Mapping
+from concurrent.futures import CancelledError
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -34,7 +35,7 @@ def classify_local_archive(
     ai = OpenAICompatibleClient(AISettings.from_config(ctx.config))
     ai.check()
     store = ArchiveStore(ctx.data_dir)
-    records = [record for record in store.records() if _is_complete_local_record(record)]
+    records = [record for record in store.reviewed_records() if _is_complete_local_record(record)]
     matched = 0
     processed = 0
     for start in range(0, len(records), LOCAL_CLASSIFY_BATCH_SIZE):
@@ -111,12 +112,14 @@ def scan_targets(
     ai.check()
     batch: list[tuple[str, bytes, dict[str, Any]]] = []
     skipped = 0
+    skipped_review = 0
     checked = 0
     saved = 0
     upgraded = 0
     volume_limited = False
     interrupted = False
     budget_reached = False
+    cancelled = False
     stop_reason = ""
     errors: list[dict[str, str]] = []
 
@@ -143,6 +146,9 @@ def scan_targets(
             folder_checked = 0
             for message_index, uid in enumerate(uids, start=1):
                 key = store.state_key(settings.user, mailbox.name, uidvalidity, uid)
+                if store.is_review_excluded_source(key):
+                    skipped_review += 1
+                    continue
                 partial = store.partial_record(key, criteria.signature)
                 if partial is not None:
                     if checked >= settings.max_messages_per_run:
@@ -153,9 +159,15 @@ def scan_targets(
                     folder_checked += 1
                     checked += 1
                     try:
+                        if progress:
+                            progress(f"{mailbox.name} UID {uid}", message_index, len(uids))
                         _download_full_message(client, store, key, partial, criteria.signature)
                         saved += 1
                         upgraded += 1
+                    except CancelledError:
+                        cancelled = True
+                        logger.info("用户取消目标扫描：folder=%s uid=%s", mailbox.name, uid)
+                        break
                     except FetchVolumeLimitError as exc:
                         volume_limited = True
                         blocked_until = store.mark_fetch_limited(settings.user, settings.volume_limit_cooldown_hours)
@@ -181,9 +193,9 @@ def scan_targets(
                 if folder_checked >= settings.max_messages_per_folder:
                     break
                 folder_checked += 1
-                if progress:
-                    progress(f"{mailbox.name} UID {uid}", message_index, len(uids))
                 try:
+                    if progress:
+                        progress(f"{mailbox.name} UID {uid}", message_index, len(uids))
                     raw = client.fetch_message_preview(uid, TARGET_SCAN_PREVIEW_BYTES)
                     if progress:
                         progress(f"{mailbox.name} UID {uid}", message_index, len(uids))
@@ -194,6 +206,12 @@ def scan_targets(
                         uidvalidity=uidvalidity,
                         uid=uid,
                     )
+                    if store.is_review_excluded_record(record["record_id"]):
+                        skipped_review += 1
+                        checked += 1
+                        store.mark(key, message_id=record["message_id"], content_sha256=record["content_sha256"], status="review_excluded", filter_signature="", record_id=record["record_id"])
+                        store.flush()
+                        continue
                     record["source_truncated"] = True
                     batch.append((key, raw, record))
                     checked += 1
@@ -210,6 +228,11 @@ def scan_targets(
                             saved,
                             skipped,
                         )
+                except CancelledError:
+                    batch.clear()
+                    cancelled = True
+                    logger.info("用户取消目标扫描：folder=%s uid=%s", mailbox.name, uid)
+                    break
                 except FetchVolumeLimitError as exc:
                     batch.clear()
                     volume_limited = True
@@ -228,7 +251,7 @@ def scan_targets(
                     if is_imap_connection_error(exc):
                         interrupted = True
                         break
-            if batch and not (volume_limited or interrupted):
+            if batch and not (volume_limited or interrupted or cancelled):
                 try:
                     saved += _process_batch(batch, store, criteria, ai, client)
                 except FetchVolumeLimitError as exc:
@@ -246,7 +269,7 @@ def scan_targets(
                 finally:
                     batch.clear()
             logger.info("目标扫描进度：文件夹 %s/%s %s", folder_index, total_folders, mailbox.name)
-            if volume_limited or interrupted or budget_reached:
+            if volume_limited or interrupted or budget_reached or cancelled:
                 break
 
     store.flush()
@@ -256,6 +279,8 @@ def scan_targets(
         stop_reason = "IMAP 连接中断；已保存完成进度，下次运行将断点续传"
     elif budget_reached:
         stop_reason = f"已达单次运行保守上限 {settings.max_messages_per_run} 封；可再次运行继续"
+    elif cancelled:
+        stop_reason = "用户已取消；已完成的邮件保留，下次运行可继续"
     return generate_target_report(
         ctx,
         criteria,
@@ -265,7 +290,9 @@ def scan_targets(
             "new_messages_saved": saved,
             "partial_messages_upgraded": upgraded,
             "incremental_skipped": skipped,
-            "incomplete": volume_limited or interrupted or budget_reached,
+            "review_excluded_skipped": skipped_review,
+            "incomplete": volume_limited or interrupted or budget_reached or cancelled,
+            "cancelled": cancelled,
             "stop_reason": stop_reason,
             "errors": errors,
         },
@@ -279,7 +306,7 @@ def generate_target_report(
 ) -> dict[str, Any]:
     criteria = criteria or TargetCriteria.load(ctx.project_root)
     store = ArchiveStore(ctx.data_dir)
-    result = build_target_storylines(store.records(), criteria)
+    result = build_target_storylines(store.reviewed_records(), criteria)
     result.update({"generated_at": datetime.now(timezone.utc).isoformat(), **(run_metadata or {})})
     output_json = ctx.output_dir / "target_storylines.json"
     output_json.parent.mkdir(parents=True, exist_ok=True)
@@ -295,10 +322,11 @@ def _process_batch(
     ai: OpenAICompatibleClient,
     client: Imap126Client,
 ) -> int:
-    filenames = [item["filename"] for _, _, record in batch for item in record.get("attachments", [])]
+    active_batch = [(key, raw, record) for key, raw, record in batch if not store.is_review_excluded_record(record["record_id"])]
+    filenames = [item["filename"] for _, _, record in active_batch for item in record.get("attachments", [])]
     filename_matches = ai.match_attachment_names(filenames, list(criteria.files))
     saved = 0
-    for key, raw, record in batch:
+    for key, raw, record in active_batch:
         reasons = _or_match_reasons(record, criteria, filename_matches)
         record["matched_by"] = reasons
         record["target_matches"] = _record_target_matches(record, filename_matches)
@@ -497,6 +525,8 @@ def _summary(result: dict[str, Any]) -> dict[str, Any]:
         "matched_messages": result["matched_messages"],
         "folders_discovered": result.get("folders_discovered", 0),
         "new_messages_saved": result.get("new_messages_saved", 0),
+        "review_excluded_skipped": result.get("review_excluded_skipped", 0),
         "incomplete": result.get("incomplete", False),
+        "cancelled": result.get("cancelled", False),
         "errors": len(result.get("errors", [])),
     }

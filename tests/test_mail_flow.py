@@ -3,12 +3,15 @@ from __future__ import annotations
 import tempfile
 import unittest
 import imaplib
+from concurrent.futures import CancelledError
 from email.message import EmailMessage
 from pathlib import Path
 from unittest.mock import patch
 
 from mail_storyline_tracker.config import AppContext
-from mail_storyline_tracker.flows.mail_flow import check_login, download, preview
+from mail_storyline_tracker.flows.mail_flow import analyze, check_login, download, preview
+from mail_storyline_tracker.modules.mail_parser import parse_message
+from mail_storyline_tracker.modules.storage import ArchiveStore
 
 
 def _message(sender: str, subject: str, body: str, message_id: str) -> bytes:
@@ -84,6 +87,131 @@ class DirectDownloadFakeImapClient(PagedFakeImapClient):
 
 
 class MailFlowTests(unittest.TestCase):
+    def test_user_cancel_is_clean_and_keeps_download_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ctx = AppContext(root, {
+                "app": {"data_dir": "data", "output_dir": "output"},
+                "mail": {
+                    "imap": {"user": "demo@126.com", "password": "secret"},
+                    "folders": ["INBOX"],
+                    "filters": {"match_mode": "any"},
+                },
+            })
+
+            def cancel_on_second(label: str, _done: int, _total: int) -> None:
+                if "UID 1" in label:
+                    raise CancelledError("任务已取消")
+
+            with patch("mail_storyline_tracker.flows.mail_flow.Imap126Client", PagedFakeImapClient), patch(
+                "mail_storyline_tracker.flows.mail_flow.logger.exception"
+            ) as log_exception:
+                first = download(ctx, progress=cancel_on_second)
+                resumed = download(ctx)
+            self.assertTrue(first["cancelled"])
+            self.assertTrue(first["incomplete"])
+            self.assertEqual(first["messages_saved"], 1)
+            self.assertEqual(first["errors"], [])
+            self.assertIn("用户已取消", first["stop_reason"])
+            self.assertEqual(resumed["messages_saved"], 1)
+            log_exception.assert_not_called()
+
+    def test_review_excluded_message_id_alias_never_gets_full_download(self) -> None:
+        class AliasClient(FakeImapClient):
+            preview_calls = 0
+            full_calls = 0
+
+            def search_filtered_uids(self, *args):
+                return ["3"], {"3": ["主题/正文关键词"]}
+
+            def fetch_message_preview(self, uid, max_bytes):
+                type(self).preview_calls += 1
+                return FakeImapClient.messages["1"][:max_bytes]
+
+            def fetch_message(self, uid):
+                type(self).full_calls += 1
+                raise AssertionError("已排除邮件别名不应完整下载")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ctx = AppContext(root, {
+                "app": {"data_dir": "data", "output_dir": "output"},
+                "mail": {
+                    "imap": {"user": "demo@126.com", "password": "secret"},
+                    "folders": ["INBOX"],
+                    "filters": {"keywords": ["验收"], "match_mode": "any"},
+                },
+            })
+            store = ArchiveStore(ctx.data_dir)
+            raw = FakeImapClient.messages["1"]
+            record = parse_message(raw, account="demo@126.com", mailbox="archive", uidvalidity="7", uid="1")
+            stored = store.save_message(raw, record)
+            store.flush()
+            store.update_review_exclusions({stored["record_id"]}, excluded=True)
+            with patch("mail_storyline_tracker.flows.mail_flow.Imap126Client", AliasClient):
+                first = download(ctx)
+                second = download(ctx)
+            self.assertEqual(AliasClient.preview_calls, 1)
+            self.assertEqual(AliasClient.full_calls, 0)
+            self.assertEqual(first["review_excluded_skipped"], 1)
+            self.assertEqual(second["review_excluded_skipped"], 1)
+
+    def test_review_excluded_source_is_never_fetched_again(self) -> None:
+        class CountingClient(PagedFakeImapClient):
+            fetched_uids: list[str] = []
+
+            def fetch_message(self, uid: str):
+                type(self).fetched_uids.append(uid)
+                return super().fetch_message(uid)
+
+            def fetch_message_preview(self, uid: str, max_bytes: int):
+                type(self).fetched_uids.append(uid)
+                return super().fetch_message_preview(uid, max_bytes)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = {
+                "app": {"data_dir": "data", "output_dir": "output"},
+                "mail": {
+                    "imap": {"user": "demo@126.com", "password": "secret"},
+                    "folders": ["INBOX"],
+                    "filters": {"keywords": ["验收"], "match_mode": "any"},
+                },
+            }
+            ctx = AppContext(root, config)
+            store = ArchiveStore(ctx.data_dir)
+            raw = FakeImapClient.messages["1"]
+            record = parse_message(raw, account="demo@126.com", mailbox="INBOX", uidvalidity="7", uid="1")
+            stored = store.save_message(raw, record)
+            store.flush()
+            store.update_review_exclusions({stored["record_id"]}, excluded=True)
+            CountingClient.fetched_uids = []
+            with patch("mail_storyline_tracker.flows.mail_flow.Imap126Client", CountingClient):
+                preview_result = preview(ctx)
+                download_result = download(ctx, {"keywords": ["项目"]})
+                direct_result = download(ctx, {"keywords": []})
+            self.assertNotIn("1", CountingClient.fetched_uids)
+            self.assertEqual(preview_result["review_excluded_skipped"], 1)
+            self.assertEqual(download_result["review_excluded_skipped"], 1)
+            self.assertEqual(direct_result["review_excluded_skipped"], 1)
+            self.assertEqual(download_result["messages_saved"], 1)  # UID 2 contains the changed keyword.
+            self.assertEqual(direct_result["local_full_reused"], 1)
+
+    def test_ai_analysis_skips_review_excluded_mail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ctx = AppContext(root, {"app": {"data_dir": "data", "output_dir": "output"}})
+            raw = _message("alice@example.com", "示例审核", "请审核。", "<excluded@example.com>")
+            store = ArchiveStore(ctx.data_dir)
+            record = parse_message(raw, account="demo@126.com", mailbox="INBOX", uidvalidity="1", uid="9")
+            stored = store.save_message(raw, record)
+            store.flush()
+            store.update_review_exclusions({stored["record_id"]}, excluded=True)
+            with patch("mail_storyline_tracker.flows.mail_flow.OpenAICompatibleClient") as ai_client:
+                with self.assertRaisesRegex(RuntimeError, "尚无可分析邮件"):
+                    analyze(ctx)
+                ai_client.assert_not_called()
+
     def test_login_check_does_not_select_or_fetch_mail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable, Mapping
+from concurrent.futures import CancelledError
 from datetime import datetime, timezone
 from typing import Any
 
@@ -67,12 +68,13 @@ def _scan(ctx: AppContext, overrides: Mapping[str, Any] | None, *, save: bool, p
             "preview": [],
             "review_html": "",
         }
-    seen = matched = saved = skipped_incremental = local_reused = 0
+    seen = matched = saved = skipped_incremental = skipped_review = local_reused = 0
     preview_rows: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     volume_limited = False
     interrupted = False
     budget_reached = False
+    cancelled = False
     stop_reason = ""
     # 无关键词时，服务器 UID 集已由日期/地址条件确定，可直接完整下载一次。
     direct_full_download = save and not settings.keywords
@@ -104,6 +106,9 @@ def _scan(ctx: AppContext, overrides: Mapping[str, Any] | None, *, save: bool, p
             folder_checked = 0
             for index, uid in enumerate(uids, start=1):
                 key = store.state_key(settings.user, mailbox, uidvalidity, uid)
+                if store.is_review_excluded_source(key):
+                    skipped_review += 1
+                    continue
                 if save and store.is_processed(key, settings.filter_signature):
                     skipped_incremental += 1
                     continue
@@ -128,13 +133,19 @@ def _scan(ctx: AppContext, overrides: Mapping[str, Any] | None, *, save: bool, p
                     break
                 folder_checked += 1
                 seen += 1
-                if progress:
-                    progress(f"{mailbox} UID {uid}", index, len(uids))
                 try:
+                    if progress:
+                        progress(f"{mailbox} UID {uid}", index, len(uids))
                     raw = client.fetch_message(uid) if direct_full_download else client.fetch_message_preview(uid, PREVIEW_BYTES)
                     if progress:
                         progress(f"{mailbox} UID {uid}", index, len(uids))
                     record = parse_message(raw, account=settings.user, mailbox=mailbox, uidvalidity=uidvalidity, uid=uid)
+                    if store.is_review_excluded_record(record["record_id"]):
+                        skipped_review += 1
+                        if save:
+                            store.mark(key, message_id=record["message_id"], content_sha256=record["content_sha256"], status="review_excluded", filter_signature="", record_id=record["record_id"])
+                            store.flush()
+                        continue
                     is_match, reasons = matches_filters(record, settings.senders, settings.recipients, settings.keywords, settings.match_mode)
                     is_match, reasons = _merge_server_matches(is_match, reasons, server_reasons.get(uid, []), settings)
                     record["matched_by"] = reasons
@@ -176,6 +187,10 @@ def _scan(ctx: AppContext, overrides: Mapping[str, Any] | None, *, save: bool, p
                     if save:
                         # 每封邮件立即生成原子检查点，断网或进程退出后不重复下载。
                         store.flush()
+                except CancelledError:
+                    cancelled = True
+                    logger.info("用户取消邮件扫描：folder=%s uid=%s", mailbox, uid)
+                    break
                 except FetchVolumeLimitError as exc:
                     volume_limited = True
                     blocked_until = store.mark_fetch_limited(settings.user, settings.volume_limit_cooldown_hours)
@@ -192,7 +207,7 @@ def _scan(ctx: AppContext, overrides: Mapping[str, Any] | None, *, save: bool, p
                     if is_imap_connection_error(exc):
                         interrupted = True
                         break
-            if volume_limited or interrupted or budget_reached:
+            if volume_limited or interrupted or budget_reached or cancelled:
                 break
     if volume_limited:
         stop_reason = f"126 IMAP FETCH 下载流量已达到阶段性上限；依据官方建议暂停至 {blocked_until}"
@@ -200,10 +215,12 @@ def _scan(ctx: AppContext, overrides: Mapping[str, Any] | None, *, save: bool, p
         stop_reason = "IMAP 连接中断；已保存完成进度，下次运行将断点续传"
     elif budget_reached:
         stop_reason = f"已达单次运行保守上限 {settings.max_messages_per_run} 封；可再次运行继续"
+    elif cancelled:
+        stop_reason = "用户已取消；已完成的邮件保留，下次运行可继续"
     if save or volume_limited:
         store.flush()
     if save:
-        review_path = write_mail_review(store.records(), ctx.output_dir / "mail_review.html")
+        review_path = write_mail_review(store.reviewed_records(), ctx.output_dir / "mail_review.html")
     else:
         review_path = None
     result = {
@@ -212,9 +229,11 @@ def _scan(ctx: AppContext, overrides: Mapping[str, Any] | None, *, save: bool, p
         "messages_matched": matched,
         "messages_saved": saved,
         "incremental_skipped": skipped_incremental,
+        "review_excluded_skipped": skipped_review,
         "local_full_reused": local_reused,
         "errors": errors,
-        "incomplete": volume_limited or interrupted or budget_reached,
+        "incomplete": volume_limited or interrupted or budget_reached or cancelled,
+        "cancelled": cancelled,
         "stop_reason": stop_reason,
         "preview": preview_rows,
         "review_html": str(review_path) if review_path is not None else "",
@@ -229,9 +248,9 @@ def check_ai(ctx: AppContext) -> dict[str, Any]:
 
 def analyze(ctx: AppContext) -> dict[str, Any]:
     store = ArchiveStore(ctx.data_dir)
-    records = store.records()
+    records = store.reviewed_records()
     if not records:
-        raise RuntimeError("尚无已下载邮件，请先执行下载归档")
+        raise RuntimeError("尚无可分析邮件，请检查下载归档与人工审核排除结果")
     conversations = group_conversations(records)
     result = OpenAICompatibleClient(AISettings.from_config(ctx.config)).summarize(conversations)
     result["generated_at"] = datetime.now(timezone.utc).isoformat()
