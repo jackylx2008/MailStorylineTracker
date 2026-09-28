@@ -116,6 +116,10 @@ class TargetFlowTests(unittest.TestCase):
         self.assertEqual(len(result["targets"]), 2)
         self.assertEqual(len(result["targets"][0]["events"]), 2)
         self.assertEqual(len(result["targets"][1]["events"]), 0)
+        first, second = result["targets"][0]["events"]
+        self.assertEqual(second["parent_record_id"], first["record_id"])
+        self.assertEqual(second["link_type"], "reply")
+        self.assertEqual(second["body_text"], "请审核并回复。")
         with tempfile.TemporaryDirectory() as directory:
             path = write_target_mindmap(
                 {
@@ -132,6 +136,9 @@ class TargetFlowTests(unittest.TestCase):
             self.assertIn("折叠全部", content)
             self.assertIn("部分扫描结果", content)
             self.assertIn("测试限流", content)
+            self.assertIn("graph-scroll", content)
+            self.assertIn("showModal()", content)
+            self.assertIn("邮件正文", content)
 
 
 if __name__ == "__main__":

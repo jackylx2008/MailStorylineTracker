@@ -12,7 +12,7 @@
 - 基于邮件回复头、规范化主题、参与人和时间接近度的会话归并。
 - 通过现有 OpenAI 兼容服务生成事项、参与人、状态、已完成、待办、责任人、截止日期、风险、来源及时间线。
 - 从本地 `target_email.env`、`target_keyword.env`、`target_file.env` 读取专项追踪范围，以联系人、关键词、AI 模糊附件名任一命中的方式扩大召回。
-- 将每个目标附件事项独立呈现在同一个可搜索、可展开折叠的思维导图式 HTML 中。
+- 将每个目标附件事项独立呈现在同一个可搜索、可展开折叠的节点连线式 HTML 中，从右侧最新结果向左回溯；点击节点简介可查看完整邮件正文。
 - Tkinter GUI、CLI、共享日志、进度和安全取消。
 
 项目不会删除、移动、标记已读或修改服务器邮件。IMAP 文件夹始终以只读方式打开。
@@ -139,6 +139,14 @@ python mail_storyline.py target-local-classify
 
 `target-scan` 会先部分读取候选邮件进行判断，最终命中后保存完整 `.eml` 和全部附件；以前只保存部分内容的命中记录会在后续扫描时自动升级为完整归档。`target-local-classify` 不连接 IMAP、不产生 FETCH，只使用已经完整下载到本地的邮件、附件文件名、`target_*.env` 和本地 AI 重新判定目标并生成报告。
 
+查看节点连线式故事线时，打开 `output/target_storylines.html`。每个事项可独立展开；页面默认定位到有事件的事项及最右侧的最新节点，向左滚动可回溯。蓝色节点表示普通往来，紫色节点表示分支，绿色节点表示当前最新结果。曲线实线来自邮件回复头，虚线仅表示同一会话中的时间顺序。点击节点上的简介链接，可在弹窗查看完整解析正文、发件人、收件人、附件名和原始 `.eml` 的本地路径。
+
+已有本地归档时，可只重新生成 JSON 和 HTML，无需连接邮箱或调用 AI：
+
+```powershell
+python mail_storyline.py target-report
+```
+
 需要限制专项扫描文件夹时，可传入精确文件夹名，例如：
 
 ```powershell
@@ -194,6 +202,7 @@ python mail_storyline.py preview --senders example.com --keywords 项目,验收 
 python mail_storyline.py download
 python mail_storyline.py target-scan
 python mail_storyline.py target-local-classify
+python mail_storyline.py target-report
 python mail_storyline.py check-ai
 python mail_storyline.py analyze
 python mail_storyline.py all
@@ -227,7 +236,7 @@ output/
   storyline.json                         AI 结构化结果
   storyline.html                         可搜索的事项时间线
   target_storylines.json                 目标附件沟通链路结构化数据
-  target_storylines.html                 思维导图式目标附件时间线
+  target_storylines.html                 节点连线式目标附件故事线
 logs/
   main.log
   mail_storyline.log

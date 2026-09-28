@@ -382,11 +382,35 @@ def build_target_storylines(records: list[dict[str, Any]], criteria: TargetCrite
                 if any(match.get("target") == target for match in record.get("target_matches", []))
             }
         )
+        events = []
+        message_ids = {
+            str(record.get("message_id", "")).casefold(): record["record_id"]
+            for record in ordered if record.get("message_id")
+        }
+        previous_by_conversation: dict[int, str] = {}
+        seen_event_ids: set[str] = set()
+        for record in ordered:
+            parent_id = ""
+            link_type = ""
+            for reference in [*record.get("in_reply_to", []), *reversed(record.get("references", []))]:
+                candidate = message_ids.get(str(reference).casefold(), "")
+                if candidate and candidate != record["record_id"] and candidate in seen_event_ids:
+                    parent_id = candidate
+                    link_type = "reply"
+                    break
+            conversation = by_record.get(record["record_id"])
+            conversation_key = id(conversation) if conversation is not None else 0
+            if not parent_id and conversation_key in previous_by_conversation:
+                parent_id = previous_by_conversation[conversation_key]
+                link_type = "sequence"
+            events.append(_event(record, target, parent_id, link_type))
+            seen_event_ids.add(record["record_id"])
+            previous_by_conversation[conversation_key] = record["record_id"]
         targets.append(
             {
                 "target": target,
                 "attachment_names": attachment_names,
-                "events": [_event(record, target) for record in ordered],
+                "events": events,
             }
         )
     return {"targets": targets, "matched_messages": len(all_related), "archived_messages": len(records)}
@@ -419,7 +443,7 @@ def _record_target_matches(record: dict[str, Any], filename_matches: dict[str, l
     return result
 
 
-def _event(record: dict[str, Any], target: str) -> dict[str, Any]:
+def _event(record: dict[str, Any], target: str, parent_id: str = "", link_type: str = "") -> dict[str, Any]:
     target_attachments = [
         item.get("filename", "")
         for item in record.get("target_matches", [])
@@ -433,10 +457,15 @@ def _event(record: dict[str, Any], target: str) -> dict[str, Any]:
         "cc": record.get("cc", ""),
         "subject": record.get("subject", ""),
         "action": _communication_action(record, target_attachments),
+        "body_text": record.get("body_text", ""),
+        "parent_record_id": parent_id,
+        "link_type": link_type,
         "attachments": target_attachments,
+        "all_attachments": [item.get("filename", "") for item in record.get("attachments", [])],
         "match_reasons": record.get("matched_by", []),
         "mailbox": record.get("mailbox", ""),
         "uid": record.get("uid", ""),
+        "eml_path": record.get("eml_path", ""),
     }
 
 
