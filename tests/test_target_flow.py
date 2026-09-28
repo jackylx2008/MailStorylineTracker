@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from email.message import EmailMessage
 from pathlib import Path
 from unittest.mock import patch
 
 from mail_storyline_tracker.modules.ai_client import AISettings, OpenAICompatibleClient
 from mail_storyline_tracker.modules.html_report import write_target_mindmap
+from mail_storyline_tracker.modules.mail_parser import parse_message
+from mail_storyline_tracker.modules.storage import ArchiveStore
 from mail_storyline_tracker.modules.target_config import TargetCriteria
-from mail_storyline_tracker.flows.target_flow import build_target_storylines
+from mail_storyline_tracker.flows.target_flow import _process_batch, build_target_storylines
 
 
 def _record(record_id: str, message_id: str, subject: str, sent_at: str, *, target: str = "", reference: str = "") -> dict:
@@ -34,6 +37,45 @@ def _record(record_id: str, message_id: str, subject: str, sent_at: str, *, targ
 
 
 class TargetFlowTests(unittest.TestCase):
+    def test_matched_target_downloads_full_eml_and_attachment_once(self) -> None:
+        message = EmailMessage()
+        message["From"] = "Alice <alice@example.com>"
+        message["To"] = "team@example.com"
+        message["Subject"] = "审核资料"
+        message["Message-ID"] = "<full-target@example.com>"
+        message.set_content("请审核附件。")
+        message.add_attachment(b"complete payload", maintype="application", subtype="pdf", filename="review.pdf")
+        raw = message.as_bytes()
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def fetch_message(self, uid: str) -> bytes:
+                self.calls += 1
+                return raw
+
+        class FakeAI:
+            def match_attachment_names(self, filenames, targets):
+                return {}
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArchiveStore(Path(directory))
+            criteria = TargetCriteria(("alice@example.com",), (), ("review",))
+            record = parse_message(raw, account="demo@126.com", mailbox="INBOX", uidvalidity="1", uid="8")
+            record["source_truncated"] = True
+            key = store.state_key("demo@126.com", "INBOX", "1", "8")
+            client = FakeClient()
+            saved = _process_batch([(key, raw, record)], store, criteria, FakeAI(), client)
+            stored = store.records()[0]
+
+            self.assertEqual(saved, 1)
+            self.assertEqual(client.calls, 1)
+            self.assertFalse(stored.get("source_truncated", False))
+            self.assertTrue(Path(stored["eml_path"]).exists())
+            self.assertTrue(Path(stored["attachments"][0]["path"]).exists())
+            self.assertIsNone(store.partial_record(key, criteria.signature))
+
     def test_target_files_are_loaded_as_independent_items(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

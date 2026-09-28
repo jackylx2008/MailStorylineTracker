@@ -81,8 +81,9 @@ class MailSettings:
         for name in ("since", "before", "match_mode"):
             if name in values and values[name] is not None:
                 changes[name] = str(values[name]).strip()
-        if "max_messages_per_folder" in values and values["max_messages_per_folder"] is not None:
-            changes["max_messages_per_folder"] = int(str(values["max_messages_per_folder"]).strip())
+        for name in ("max_messages_per_folder", "max_messages_per_run"):
+            if name in values and values[name] is not None:
+                changes[name] = int(str(values[name]).strip())
         result = replace(self, **changes)
         result.validate_filters()
         return result

@@ -67,13 +67,15 @@ def _scan(ctx: AppContext, overrides: Mapping[str, Any] | None, *, save: bool, p
             "preview": [],
             "review_html": "",
         }
-    seen = matched = saved = skipped_incremental = 0
+    seen = matched = saved = skipped_incremental = local_reused = 0
     preview_rows: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     volume_limited = False
     interrupted = False
     budget_reached = False
     stop_reason = ""
+    # 无关键词时，服务器 UID 集已由日期/地址条件确定，可直接完整下载一次。
+    direct_full_download = save and not settings.keywords
     with Imap126Client(settings) as client:
         for mailbox in settings.folders:
             if seen >= settings.max_messages_per_run:
@@ -105,6 +107,20 @@ def _scan(ctx: AppContext, overrides: Mapping[str, Any] | None, *, save: bool, p
                 if save and store.is_processed(key, settings.filter_signature):
                     skipped_incremental += 1
                     continue
+                if direct_full_download:
+                    existing = store.full_record_for_source(settings.user, mailbox, uidvalidity, uid)
+                    if existing is not None:
+                        store.mark(
+                            key,
+                            message_id=str(existing.get("message_id", "")),
+                            content_sha256=str(existing.get("content_sha256", "")),
+                            status="saved",
+                            filter_signature=settings.filter_signature,
+                            record_id=str(existing.get("record_id", "")),
+                        )
+                        store.flush()
+                        local_reused += 1
+                        continue
                 if seen >= settings.max_messages_per_run:
                     budget_reached = True
                     break
@@ -115,7 +131,7 @@ def _scan(ctx: AppContext, overrides: Mapping[str, Any] | None, *, save: bool, p
                 if progress:
                     progress(f"{mailbox} UID {uid}", index, len(uids))
                 try:
-                    raw = client.fetch_message_preview(uid, PREVIEW_BYTES)
+                    raw = client.fetch_message(uid) if direct_full_download else client.fetch_message_preview(uid, PREVIEW_BYTES)
                     if progress:
                         progress(f"{mailbox} UID {uid}", index, len(uids))
                     record = parse_message(raw, account=settings.user, mailbox=mailbox, uidvalidity=uidvalidity, uid=uid)
@@ -135,22 +151,23 @@ def _scan(ctx: AppContext, overrides: Mapping[str, Any] | None, *, save: bool, p
                     if is_match:
                         matched += 1
                     if save and is_match:
-                        raw = client.fetch_message(uid)
-                        record = parse_message(raw, account=settings.user, mailbox=mailbox, uidvalidity=uidvalidity, uid=uid)
-                        _matched, full_reasons = matches_filters(
-                            record,
-                            settings.senders,
-                            settings.recipients,
-                            settings.keywords,
-                            settings.match_mode,
-                        )
-                        _matched, reasons = _merge_server_matches(
-                            _matched,
-                            full_reasons,
-                            server_reasons.get(uid, []),
-                            settings,
-                        )
-                        record["matched_by"] = reasons
+                        if not direct_full_download:
+                            raw = client.fetch_message(uid)
+                            record = parse_message(raw, account=settings.user, mailbox=mailbox, uidvalidity=uidvalidity, uid=uid)
+                            _matched, full_reasons = matches_filters(
+                                record,
+                                settings.senders,
+                                settings.recipients,
+                                settings.keywords,
+                                settings.match_mode,
+                            )
+                            _matched, reasons = _merge_server_matches(
+                                _matched,
+                                full_reasons,
+                                server_reasons.get(uid, []),
+                                settings,
+                            )
+                            record["matched_by"] = reasons
                         stored = store.save_message(raw, record)
                         saved += 1
                         store.mark(key, message_id=record["message_id"], content_sha256=record["content_sha256"], status="saved", filter_signature=settings.filter_signature, record_id=stored["record_id"])
@@ -195,6 +212,7 @@ def _scan(ctx: AppContext, overrides: Mapping[str, Any] | None, *, save: bool, p
         "messages_matched": matched,
         "messages_saved": saved,
         "incremental_skipped": skipped_incremental,
+        "local_full_reused": local_reused,
         "errors": errors,
         "incomplete": volume_limited or interrupted or budget_reached,
         "stop_reason": stop_reason,

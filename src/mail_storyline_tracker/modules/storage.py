@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,42 @@ class ArchiveStore:
     def is_processed(self, key: str, filter_signature: str) -> bool:
         item = self._state["items"].get(key, {})
         return item.get("filter_signature") == filter_signature and item.get("status") in {"saved", "not_matched"}
+
+    def partial_record(self, key: str, filter_signature: str) -> dict[str, Any] | None:
+        """返回已命中但尚未完整下载的记录，用于断点升级完整 EML 和附件。"""
+        item = self._state["items"].get(key, {})
+        if item.get("filter_signature") != filter_signature or item.get("status") != "saved":
+            return None
+        record = self._records["records"].get(item.get("record_id", ""))
+        if not isinstance(record, dict) or not record.get("source_truncated"):
+            return None
+        return dict(record)
+
+    def full_record_for_source(
+        self,
+        account: str,
+        mailbox: str,
+        uidvalidity: str,
+        uid: str,
+    ) -> dict[str, Any] | None:
+        """查找其他下载队列已完整保存的同一服务器邮件，避免跨规则重复 FETCH。"""
+        expected = {
+            "account": account,
+            "mailbox": mailbox,
+            "uidvalidity": uidvalidity,
+            "uid": uid,
+        }
+        for record in self._records["records"].values():
+            if record.get("source_truncated"):
+                continue
+            path = Path(str(record.get("eml_path", "")))
+            if path.suffix.lower() != ".eml" or not path.is_file():
+                continue
+            for source in record.get("sources", []):
+                actual = {name: str(source.get(name, "")) for name in expected}
+                if actual == expected:
+                    return dict(record)
+        return None
 
     def mark(self, key: str, *, message_id: str, content_sha256: str, status: str, filter_signature: str, record_id: str = "") -> None:
         self._state["items"][key] = {
@@ -94,6 +131,12 @@ class ArchiveStore:
     def records(self) -> list[dict[str, Any]]:
         return sorted(self._records["records"].values(), key=lambda item: item.get("sent_at", ""))
 
+    def update_record_metadata(self, record_id: str, **values: Any) -> None:
+        record = self._records["records"].get(record_id)
+        if not isinstance(record, dict):
+            raise KeyError(f"未找到本地邮件记录：{record_id}")
+        record.update(values)
+
     def flush(self) -> None:
         _write_json_atomic(self.state_path, self._state)
         _write_json_atomic(self.records_path, self._records)
@@ -121,4 +164,12 @@ def _write_text_atomic(path: Path, value: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
     temporary.write_text(value, encoding="utf-8")
-    temporary.replace(path)
+    for attempt in range(6):
+        try:
+            temporary.replace(path)
+            return
+        except PermissionError:
+            if attempt == 5:
+                raise
+            # CloudStation/OneDrive 可能短暂锁定目标文件，有限退避后再原子替换。
+            time.sleep(0.25 * (2**attempt))

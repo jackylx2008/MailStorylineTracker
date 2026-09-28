@@ -95,7 +95,10 @@ GUI 中的修改只影响当前运行，不会改写配置文件。
 - 默认每次 FETCH 至少间隔 1.5 秒；每 10 次请求暂停 20 秒。
 - 默认每个文件夹、且所有文件夹合计每轮最多处理 50 封尚未处理的候选邮件。
 - 每处理完一封普通归档邮件就原子写入进度；遇到断网、超时或 IMAP 会话中断时立即停止，不在当次运行内重发不确定的 FETCH，下次运行从 UID 断点续传。
-- 预览和目标附件初筛使用部分读取；只有普通归档最终命中的邮件才读取完整内容及附件。
+- 预览和目标附件初筛使用部分读取；普通归档或专项扫描最终命中后，才读取并保存完整 `.eml` 及全部附件。
+- 无关键词的整文件夹归档和纯地址候选归档直接执行一次完整 FETCH，避免同一封邮件先预览、再完整下载的重复请求。
+- 已有完整本地邮件可由其他筛选队列复用，不会因为队列或筛选签名不同而重复 FETCH。
+- CloudStation、OneDrive 等同步目录短暂占用状态文件时，原子写入会进行有限次数退避重试。
 
 网易没有公开具体的第三方客户端请求频率、单次运行字节数或累计流量阈值。因此 1.5 秒、10 封、20 秒和 50 封是本项目的保守默认值，不是网易公布的硬性限额。
 
@@ -131,9 +134,34 @@ GUI 的“目标附件链路”页会在启动时把三个文件的内容分别�
 
 ```powershell
 python mail_storyline.py target-scan
+python mail_storyline.py target-local-classify
+```
+
+`target-scan` 会先部分读取候选邮件进行判断，最终命中后保存完整 `.eml` 和全部附件；以前只保存部分内容的命中记录会在后续扫描时自动升级为完整归档。`target-local-classify` 不连接 IMAP、不产生 FETCH，只使用已经完整下载到本地的邮件、附件文件名、`target_*.env` 和本地 AI 重新判定目标并生成报告。
+
+需要限制专项扫描文件夹时，可传入精确文件夹名，例如：
+
+```powershell
+python mail_storyline.py target-scan --folders INBOX,声学
 ```
 
 详细规则见 [docs/TARGET_ATTACHMENT_TRACKING.md](docs/TARGET_ATTACHMENT_TRACKING.md)。
+
+## 完整邮件与附件归档队列
+
+根目录的 `download_priority_mail.py` 为长时间、小批量归档提供三个独立断点队列：
+
+- `acoustics`：完整归档“声学”文件夹内的邮件和附件。
+- `sent`：完整归档“已发送”文件夹内的邮件和附件。
+- `target-email`：在全部可选择文件夹中，完整归档 From、To 或 Cc 命中 `target_email.env` 的邮件和附件。
+
+```powershell
+python download_priority_mail.py acoustics --batch 5
+python download_priority_mail.py sent --batch 5
+python download_priority_mail.py target-email --batch 5
+```
+
+`--batch` 允许 `1` 至 `50`，建议从 `5` 或 `10` 开始。三个队列有意清除普通筛选的日期范围，以便完成历史邮件追溯；每次成功落盘后立即记录断点，再次运行只处理尚未完成的 UID。无关键词队列对每封新邮件只做一次完整 FETCH，其他队列若已归档同一 `UIDVALIDITY + UID`，会直接复用本地完整记录。
 
 ## AI 服务
 
@@ -165,6 +193,7 @@ python mail_storyline.py list-folders
 python mail_storyline.py preview --senders example.com --keywords 项目,验收 --match-mode any --max-messages-per-folder 50
 python mail_storyline.py download
 python mail_storyline.py target-scan
+python mail_storyline.py target-local-classify
 python mail_storyline.py check-ai
 python mail_storyline.py analyze
 python mail_storyline.py all
@@ -211,6 +240,7 @@ logs/
 ```text
 main.py                                  GUI 入口
 mail_storyline.py                        CLI 入口
+download_priority_mail.py                完整归档断点队列入口
 logging_config.py                        统一日志
 src/mail_storyline_tracker/modules/      IMAP、解析、存储、会话、AI、HTML
 src/mail_storyline_tracker/flows/        工作流编排

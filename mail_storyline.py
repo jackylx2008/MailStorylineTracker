@@ -34,13 +34,19 @@ if str(SRC) not in sys.path:
 from logging_config import configure_utf8_stdio, setup_logger
 from mail_storyline_tracker.config import bootstrap
 from mail_storyline_tracker.flows.mail_flow import analyze, check_ai, check_connection, check_login, download, list_folders, preview
-from mail_storyline_tracker.flows.target_flow import generate_target_report, scan_targets
+from mail_storyline_tracker.flows.target_flow import classify_local_archive, generate_target_report, scan_targets
 from mail_storyline_tracker.modules.target_config import TargetCriteria
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("action", choices=("check-login", "check-mail", "list-folders", "preview", "download", "target-scan", "target-report", "check-ai", "analyze", "all"))
+    parser.add_argument(
+        "action",
+        choices=(
+            "check-login", "check-mail", "list-folders", "preview", "download", "target-scan",
+            "target-local-classify", "target-report", "check-ai", "analyze", "all",
+        ),
+    )
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--folders", help="逗号分隔的邮箱文件夹")
     parser.add_argument("--senders", help="逗号分隔的发件人地址或片段")
@@ -84,7 +90,9 @@ def main() -> int:
     elif args.action == "download":
         result = download(ctx, overrides)
     elif args.action == "target-scan":
-        result = scan_targets(ctx)
+        result = scan_targets(ctx, overrides=overrides)
+    elif args.action == "target-local-classify":
+        result = classify_local_archive(ctx)
     elif args.action == "target-report":
         result = generate_target_report(ctx, TargetCriteria.load(PROJECT_ROOT), {"incomplete": True, "stop_reason": "仅使用当前本地增量数据生成"})
     elif args.action == "check-ai":

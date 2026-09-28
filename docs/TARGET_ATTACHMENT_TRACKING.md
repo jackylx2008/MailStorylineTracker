@@ -42,7 +42,7 @@ OR 主题/正文/附件名命中目标关键词
 OR 附件名被本地 AI 判定为目标事项
 ```
 
-匹配原因写入邮件结构化记录，便于在输出页面追溯。
+匹配原因写入邮件结构化记录，便于在输出页面追溯。候选初筛只读取部分内容；确认命中后保存完整 `.eml` 和全部附件。历史上只保存部分内容的命中记录会在后续扫描时自动升级为完整归档。
 
 ## 4. 附件名 AI 匹配
 
@@ -85,7 +85,10 @@ OR 附件名被本地 AI 判定为目标事项
 python mail_storyline.py check-ai
 python mail_storyline.py check-login
 python mail_storyline.py target-scan
+python mail_storyline.py target-local-classify
 ```
+
+`target-local-classify` 仅重判已经完整下载的本地邮件，不登录邮箱、不发出 FETCH。它会结合当前 `target_*.env` 和本地 AI 对附件文件名重新分类，并更新目标报告。专项扫描也可通过 `--folders` 只处理明确指定的文件夹。
 
 输出：
 

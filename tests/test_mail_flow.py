@@ -59,9 +59,27 @@ class PagedFakeImapClient(FakeImapClient):
 
 
 class DisconnectingFakeImapClient(PagedFakeImapClient):
+    def fetch_message(self, uid: str):
+        if uid == "1":
+            raise imaplib.IMAP4.abort("socket closed")
+        return super().fetch_message(uid)
+
     def fetch_message_preview(self, uid: str, max_bytes: int):
         if uid == "1":
             raise imaplib.IMAP4.abort("socket closed")
+        return super().fetch_message_preview(uid, max_bytes)
+
+
+class DirectDownloadFakeImapClient(PagedFakeImapClient):
+    preview_calls = 0
+    full_calls = 0
+
+    def fetch_message(self, uid: str):
+        type(self).full_calls += 1
+        return super().fetch_message(uid)
+
+    def fetch_message_preview(self, uid: str, max_bytes: int):
+        type(self).preview_calls += 1
         return super().fetch_message_preview(uid, max_bytes)
 
 
@@ -163,6 +181,59 @@ class MailFlowTests(unittest.TestCase):
             self.assertEqual(result["messages_checked"], 1)
             self.assertTrue(result["incomplete"])
             self.assertIn("单次运行保守上限", result["stop_reason"])
+
+    def test_unfiltered_archive_uses_one_full_fetch_per_message(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = {
+                "app": {"data_dir": "data", "output_dir": "output"},
+                "mail": {
+                    "imap": {"host": "imap.126.com", "port": 993, "user": "demo@126.com", "password": "secret"},
+                    "folders": ["声学"],
+                    "max_messages_per_folder": 1,
+                    "max_messages_per_run": 1,
+                    "filters": {"match_mode": "any"},
+                },
+            }
+            DirectDownloadFakeImapClient.preview_calls = 0
+            DirectDownloadFakeImapClient.full_calls = 0
+            with patch("mail_storyline_tracker.flows.mail_flow.Imap126Client", DirectDownloadFakeImapClient):
+                result = download(AppContext(root, config))
+            self.assertEqual(result["messages_saved"], 1)
+            self.assertEqual(DirectDownloadFakeImapClient.preview_calls, 0)
+            self.assertEqual(DirectDownloadFakeImapClient.full_calls, 1)
+
+    def test_address_queue_reuses_full_mail_from_folder_archive(self) -> None:
+        class AddressReuseFakeImapClient(DirectDownloadFakeImapClient):
+            def __init__(self, settings) -> None:
+                super().__init__(settings)
+                self.address_filtered = bool(settings.senders or settings.recipients)
+
+            def search_filtered_uids(self, since, before, maximum, senders, recipients, keywords, match_mode):
+                if self.address_filtered:
+                    return ["2"], {"2": ["发件人"]}
+                return super().search_filtered_uids(since, before, maximum, senders, recipients, keywords, match_mode)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = {
+                "app": {"data_dir": "data", "output_dir": "output"},
+                "mail": {
+                    "imap": {"host": "imap.126.com", "port": 993, "user": "demo@126.com", "password": "secret"},
+                    "folders": ["声学"],
+                    "max_messages_per_folder": 1,
+                    "max_messages_per_run": 1,
+                    "filters": {"match_mode": "any"},
+                },
+            }
+            ctx = AppContext(root, config)
+            AddressReuseFakeImapClient.preview_calls = 0
+            AddressReuseFakeImapClient.full_calls = 0
+            with patch("mail_storyline_tracker.flows.mail_flow.Imap126Client", AddressReuseFakeImapClient):
+                download(ctx)
+                address_result = download(ctx, {"senders": ["news@example.com"]})
+            self.assertEqual(AddressReuseFakeImapClient.full_calls, 1)
+            self.assertEqual(address_result["local_full_reused"], 1)
 
     def test_connection_abort_stops_and_keeps_completed_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

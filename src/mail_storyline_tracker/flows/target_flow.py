@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from ..config import AppContext
@@ -21,15 +22,81 @@ logger = logging.getLogger(__name__)
 Progress = Callable[[str, int, int], None]
 TARGET_SCAN_BATCH_SIZE = 10
 TARGET_SCAN_PREVIEW_BYTES = 128 * 1024
+LOCAL_CLASSIFY_BATCH_SIZE = 20
+
+
+def classify_local_archive(
+    ctx: AppContext,
+    criteria: TargetCriteria | None = None,
+) -> dict[str, Any]:
+    """用 target_*.env 重判已完整归档邮件，全程不访问 IMAP。"""
+    criteria = criteria or TargetCriteria.load(ctx.project_root)
+    ai = OpenAICompatibleClient(AISettings.from_config(ctx.config))
+    ai.check()
+    store = ArchiveStore(ctx.data_dir)
+    records = [record for record in store.records() if _is_complete_local_record(record)]
+    matched = 0
+    processed = 0
+    for start in range(0, len(records), LOCAL_CLASSIFY_BATCH_SIZE):
+        batch = records[start : start + LOCAL_CLASSIFY_BATCH_SIZE]
+        filenames = [
+            item.get("filename", "")
+            for record in batch
+            for item in record.get("attachments", [])
+        ]
+        filename_matches = ai.match_attachment_names(filenames, list(criteria.files))
+        for record in batch:
+            reasons = _or_match_reasons(record, criteria, filename_matches)
+            target_matches = _record_target_matches(record, filename_matches)
+            store.update_record_metadata(
+                str(record["record_id"]),
+                matched_by=reasons,
+                target_matches=target_matches,
+            )
+            status = "saved" if reasons else "not_matched"
+            if reasons:
+                matched += 1
+            for source in record.get("sources", []):
+                key = store.state_key(
+                    str(source.get("account", record.get("account", ""))),
+                    str(source.get("mailbox", "")),
+                    str(source.get("uidvalidity", "")),
+                    str(source.get("uid", "")),
+                )
+                store.mark(
+                    key,
+                    message_id=str(record.get("message_id", "")),
+                    content_sha256=str(record.get("content_sha256", "")),
+                    status=status,
+                    filter_signature=criteria.signature,
+                    record_id=str(record["record_id"]) if reasons else "",
+                )
+            processed += 1
+        store.flush()
+    report = generate_target_report(
+        ctx,
+        criteria,
+        {
+            "local_only": True,
+            "local_records_classified": processed,
+            "local_records_matched": matched,
+            "incomplete": True,
+            "stop_reason": "仅完成本地归档重判，服务器未归档邮件仍需继续扫描",
+        },
+    )
+    report["local_records_classified"] = processed
+    report["local_records_matched"] = matched
+    return report
 
 
 def scan_targets(
     ctx: AppContext,
     progress: Progress | None = None,
     criteria: TargetCriteria | None = None,
+    overrides: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     criteria = criteria or TargetCriteria.load(ctx.project_root)
-    settings = MailSettings.from_config(ctx.config)
+    settings = MailSettings.from_config(ctx.config).with_overrides(overrides)
     ai = OpenAICompatibleClient(AISettings.from_config(ctx.config))
     store = ArchiveStore(ctx.data_dir)
     blocked_until = store.fetch_blocked_until(settings.user)
@@ -46,6 +113,7 @@ def scan_targets(
     skipped = 0
     checked = 0
     saved = 0
+    upgraded = 0
     volume_limited = False
     interrupted = False
     budget_reached = False
@@ -54,6 +122,9 @@ def scan_targets(
 
     with Imap126Client(settings) as client:
         mailboxes = [item for item in client.list_mailboxes() if not _has_noselect(item.flags)]
+        if overrides and overrides.get("folders") is not None:
+            requested = {name.casefold() for name in settings.folders}
+            mailboxes = [item for item in mailboxes if item.name.casefold() in requested]
         total_folders = len(mailboxes)
         for folder_index, mailbox in enumerate(mailboxes, start=1):
             if checked >= settings.max_messages_per_run:
@@ -72,6 +143,35 @@ def scan_targets(
             folder_checked = 0
             for message_index, uid in enumerate(uids, start=1):
                 key = store.state_key(settings.user, mailbox.name, uidvalidity, uid)
+                partial = store.partial_record(key, criteria.signature)
+                if partial is not None:
+                    if checked >= settings.max_messages_per_run:
+                        budget_reached = True
+                        break
+                    if folder_checked >= settings.max_messages_per_folder:
+                        break
+                    folder_checked += 1
+                    checked += 1
+                    try:
+                        _download_full_message(client, store, key, partial, criteria.signature)
+                        saved += 1
+                        upgraded += 1
+                    except FetchVolumeLimitError as exc:
+                        volume_limited = True
+                        blocked_until = store.mark_fetch_limited(settings.user, settings.volume_limit_cooldown_hours)
+                        errors.append({
+                            "mailbox": mailbox.name,
+                            "uid": uid,
+                            "error": f"{exc}；本地保护暂停至 {blocked_until}",
+                        })
+                        break
+                    except Exception as exc:
+                        logger.exception("升级完整邮件失败：folder=%s uid=%s", mailbox.name, uid)
+                        errors.append({"mailbox": mailbox.name, "uid": uid, "error": f"{type(exc).__name__}: {exc}"})
+                        if is_imap_connection_error(exc):
+                            interrupted = True
+                            break
+                    continue
                 if store.is_processed(key, criteria.signature):
                     skipped += 1
                     continue
@@ -98,7 +198,7 @@ def scan_targets(
                     batch.append((key, raw, record))
                     checked += 1
                     if len(batch) >= TARGET_SCAN_BATCH_SIZE:
-                        saved += _process_batch(batch, store, criteria, ai)
+                        saved += _process_batch(batch, store, criteria, ai, client)
                         batch.clear()
                     if message_index == 1 or message_index == len(uids) or message_index % 25 == 0:
                         logger.info(
@@ -111,6 +211,7 @@ def scan_targets(
                             skipped,
                         )
                 except FetchVolumeLimitError as exc:
+                    batch.clear()
                     volume_limited = True
                     blocked_until = store.mark_fetch_limited(settings.user, settings.volume_limit_cooldown_hours)
                     logger.warning("目标扫描因 126 下载流量限制暂停：folder=%s uid=%s", mailbox.name, uid)
@@ -121,14 +222,29 @@ def scan_targets(
                     })
                     break
                 except Exception as exc:
+                    batch.clear()
                     logger.exception("邮件处理失败：folder=%s uid=%s", mailbox.name, uid)
                     errors.append({"mailbox": mailbox.name, "uid": uid, "error": f"{type(exc).__name__}: {exc}"})
                     if is_imap_connection_error(exc):
                         interrupted = True
                         break
-            if batch:
-                saved += _process_batch(batch, store, criteria, ai)
-                batch.clear()
+            if batch and not (volume_limited or interrupted):
+                try:
+                    saved += _process_batch(batch, store, criteria, ai, client)
+                except FetchVolumeLimitError as exc:
+                    volume_limited = True
+                    blocked_until = store.mark_fetch_limited(settings.user, settings.volume_limit_cooldown_hours)
+                    errors.append({
+                        "mailbox": mailbox.name,
+                        "uid": batch[0][2].get("uid", ""),
+                        "error": f"{exc}；本地保护暂停至 {blocked_until}",
+                    })
+                except Exception as exc:
+                    logger.exception("目标邮件批处理失败：folder=%s", mailbox.name)
+                    errors.append({"mailbox": mailbox.name, "uid": "", "error": f"{type(exc).__name__}: {exc}"})
+                    interrupted = is_imap_connection_error(exc)
+                finally:
+                    batch.clear()
             logger.info("目标扫描进度：文件夹 %s/%s %s", folder_index, total_folders, mailbox.name)
             if volume_limited or interrupted or budget_reached:
                 break
@@ -147,6 +263,7 @@ def scan_targets(
             "folders_discovered": total_folders,
             "new_messages_checked": checked,
             "new_messages_saved": saved,
+            "partial_messages_upgraded": upgraded,
             "incremental_skipped": skipped,
             "incomplete": volume_limited or interrupted or budget_reached,
             "stop_reason": stop_reason,
@@ -176,6 +293,7 @@ def _process_batch(
     store: ArchiveStore,
     criteria: TargetCriteria,
     ai: OpenAICompatibleClient,
+    client: Imap126Client,
 ) -> int:
     filenames = [item["filename"] for _, _, record in batch for item in record.get("attachments", [])]
     filename_matches = ai.match_attachment_names(filenames, list(criteria.files))
@@ -185,23 +303,49 @@ def _process_batch(
         record["matched_by"] = reasons
         record["target_matches"] = _record_target_matches(record, filename_matches)
         if reasons:
-            stored = store.save_message(raw, record)
+            _download_full_message(client, store, key, record, criteria.signature)
             saved += 1
-            status = "saved"
-            record_id = stored["record_id"]
         else:
-            status = "not_matched"
-            record_id = ""
-        store.mark(
-            key,
-            message_id=record["message_id"],
-            content_sha256=record["content_sha256"],
-            status=status,
-            filter_signature=criteria.signature,
-            record_id=record_id,
-        )
-    store.flush()
+            store.mark(
+                key,
+                message_id=record["message_id"],
+                content_sha256=record["content_sha256"],
+                status="not_matched",
+                filter_signature=criteria.signature,
+            )
+            store.flush()
     return saved
+
+
+def _download_full_message(
+    client: Imap126Client,
+    store: ArchiveStore,
+    key: str,
+    matched_record: dict[str, Any],
+    filter_signature: str,
+) -> dict[str, Any]:
+    """下载完整原始邮件，解包所有附件，成功后才写入完成状态。"""
+    raw = client.fetch_message(str(matched_record["uid"]))
+    record = parse_message(
+        raw,
+        account=str(matched_record["account"]),
+        mailbox=str(matched_record["mailbox"]),
+        uidvalidity=str(matched_record["uidvalidity"]),
+        uid=str(matched_record["uid"]),
+    )
+    record["matched_by"] = list(matched_record.get("matched_by", []))
+    record["target_matches"] = list(matched_record.get("target_matches", []))
+    stored = store.save_message(raw, record)
+    store.mark(
+        key,
+        message_id=record["message_id"],
+        content_sha256=record["content_sha256"],
+        status="saved",
+        filter_signature=filter_signature,
+        record_id=stored["record_id"],
+    )
+    store.flush()
+    return stored
 
 
 def build_target_storylines(records: list[dict[str, Any]], criteria: TargetCriteria) -> dict[str, Any]:
@@ -310,6 +454,11 @@ def _communication_action(record: dict[str, Any], target_attachments: list[str])
 
 def _has_noselect(flags: tuple[str, ...]) -> bool:
     return any(flag.lower() == "\\noselect" for flag in flags)
+
+
+def _is_complete_local_record(record: dict[str, Any]) -> bool:
+    path = Path(str(record.get("eml_path", "")))
+    return not record.get("source_truncated") and path.suffix.lower() == ".eml" and path.is_file()
 
 
 def _summary(result: dict[str, Any]) -> dict[str, Any]:
