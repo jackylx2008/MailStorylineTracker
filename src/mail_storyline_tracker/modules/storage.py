@@ -40,7 +40,7 @@ class ArchiveStore:
         return record_id in self.excluded_record_ids()
 
     def _review_excluded_source_keys(self) -> set[str]:
-        keys = set()
+        keys = set(self._review_state.get("excluded_source_keys", []))
         for record_id in self.excluded_record_ids():
             record = self._records["records"].get(record_id, {})
             for source in record.get("sources", []):
@@ -165,16 +165,52 @@ class ArchiveStore:
         return [record for record in self.records() if str(record.get("record_id", "")) not in excluded]
 
     def update_review_exclusions(self, record_ids: set[str], *, excluded: bool) -> set[str]:
-        unknown = record_ids - self._records["records"].keys()
+        return self.apply_review_decisions(record_ids if excluded else set(), set() if excluded else record_ids)
+
+    def apply_review_decisions(self, exclude_ids: set[str], restore_ids: set[str]) -> set[str]:
+        if exclude_ids & restore_ids:
+            raise ValueError("同一邮件不能同时排除和恢复")
+        unknown = (exclude_ids - self.excluded_record_ids() | restore_ids) - self._records["records"].keys()
         if unknown:
             raise KeyError(f"审核记录不存在：{len(unknown)} 条")
         current = self.excluded_record_ids()
-        updated = current | record_ids if excluded else current - record_ids
+        updated = (current | exclude_ids) - restore_ids
         if updated != current:
             self._review_state["excluded_record_ids"] = sorted(updated)
             _write_json_atomic(self.review_state_path, self._review_state)
             self._excluded_source_keys = self._review_excluded_source_keys()
         return updated
+
+    def delete_excluded_content(self) -> int:
+        """删除审核排除邮件的本地内容，持久保存去重标识。"""
+        excluded = self.excluded_record_ids()
+        keys = self._review_excluded_source_keys()
+        self._review_state["excluded_source_keys"] = sorted(keys)
+        _write_json_atomic(self.review_state_path, self._review_state)
+        retained_paths = set()
+        for record in self.reviewed_records():
+            for value in [record.get("eml_path"), *[a.get("path") for a in record.get("attachments", [])]]:
+                if value:
+                    retained_paths.add(Path(value).resolve())
+        paths = set()
+        for rid in excluded:
+            record = self._records["records"].get(rid, {})
+            for value in [record.get("eml_path"), *[a.get("path") for a in record.get("attachments", [])]]:
+                if value:
+                    path = Path(value).resolve()
+                    if not path.is_relative_to(self.raw_dir.resolve()):
+                        raise ValueError("邮件文件不在本地归档目录内，停止删除")
+                    if path not in retained_paths:
+                        paths.add(path)
+        for path in paths:
+            path.unlink(missing_ok=True)
+        count = 0
+        for rid in excluded:
+            if self._records["records"].pop(rid, None) is not None:
+                count += 1
+        self._excluded_source_keys = keys
+        self.flush()
+        return count
 
     def update_record_metadata(self, record_id: str, **values: Any) -> None:
         record = self._records["records"].get(record_id)

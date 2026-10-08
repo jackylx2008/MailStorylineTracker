@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import unicodedata
 from collections.abc import Callable, Mapping
 from concurrent.futures import CancelledError
 from datetime import datetime, timezone
+from email.utils import getaddresses
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +18,7 @@ from ..modules.imap_client import FetchVolumeLimitError, Imap126Client, is_imap_
 from ..modules.mail_parser import parse_message
 from ..modules.mail_settings import MailSettings
 from ..modules.storage import ArchiveStore
+from ..modules.event_links import EventLinkStore
 from ..modules.target_config import TargetCriteria
 from ..modules.threading import group_conversations
 
@@ -32,8 +36,7 @@ def classify_local_archive(
 ) -> dict[str, Any]:
     """用 target_*.env 重判已完整归档邮件，全程不访问 IMAP。"""
     criteria = criteria or TargetCriteria.load(ctx.project_root)
-    ai = OpenAICompatibleClient(AISettings.from_config(ctx.config))
-    ai.check()
+    ai = _FilenameMatcher()
     store = ArchiveStore(ctx.data_dir)
     records = [record for record in store.reviewed_records() if _is_complete_local_record(record)]
     matched = 0
@@ -98,7 +101,7 @@ def scan_targets(
 ) -> dict[str, Any]:
     criteria = criteria or TargetCriteria.load(ctx.project_root)
     settings = MailSettings.from_config(ctx.config).with_overrides(overrides)
-    ai = OpenAICompatibleClient(AISettings.from_config(ctx.config))
+    ai = _FilenameMatcher()
     store = ArchiveStore(ctx.data_dir)
     blocked_until = store.fetch_blocked_until(settings.user)
     if blocked_until:
@@ -109,7 +112,6 @@ def scan_targets(
             criteria,
             {"incomplete": True, "stop_reason": reason, "errors": [{"mailbox": "", "uid": "", "error": reason}]},
         )
-    ai.check()
     batch: list[tuple[str, bytes, dict[str, Any]]] = []
     skipped = 0
     skipped_review = 0
@@ -303,16 +305,13 @@ def generate_target_report(
     ctx: AppContext,
     criteria: TargetCriteria | None = None,
     run_metadata: dict[str, Any] | None = None,
+    *,
+    filename_only: bool = False,
 ) -> dict[str, Any]:
-    criteria = criteria or TargetCriteria.load(ctx.project_root)
+    from ..modules.html_report import write_mail_review
     store = ArchiveStore(ctx.data_dir)
-    result = build_target_storylines(store.reviewed_records(), criteria)
-    result.update({"generated_at": datetime.now(timezone.utc).isoformat(), **(run_metadata or {})})
-    output_json = ctx.output_dir / "target_storylines.json"
-    output_json.parent.mkdir(parents=True, exist_ok=True)
-    output_json.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    output_html = write_target_mindmap(result, ctx.output_dir / "target_storylines.html")
-    return {"json": str(output_json), "html": str(output_html), "summary": _summary(result)}
+    path = write_mail_review(store.reviewed_records(), ctx.output_dir / "mail_review.html")
+    return {"html": str(path), "review_html": str(path), "summary": {"messages": len(store.reviewed_records())}, **(run_metadata or {})}
 
 
 def _process_batch(
@@ -376,7 +375,15 @@ def _download_full_message(
     return stored
 
 
-def build_target_storylines(records: list[dict[str, Any]], criteria: TargetCriteria) -> dict[str, Any]:
+def build_target_storylines(
+    records: list[dict[str, Any]],
+    criteria: TargetCriteria,
+    decisions: dict[str, dict[str, Any]] | None = None,
+    *,
+    filename_only: bool = False,
+) -> dict[str, Any]:
+    """Only filename-matched mail can seed a target; proposed links are not accepted facts."""
+    decisions = decisions or {}
     conversations = group_conversations(records)
     by_record: dict[str, dict[str, Any]] = {}
     for conversation in conversations:
@@ -388,7 +395,7 @@ def build_target_storylines(records: list[dict[str, Any]], criteria: TargetCrite
         seeds = {
             record["record_id"]
             for record in records
-            if any(item.get("target") == target for item in record.get("target_matches", []))
+            if _target_attachment_names(record, target, filename_only)
         }
         related: dict[str, dict[str, Any]] = {}
         for record_id in seeds:
@@ -400,14 +407,13 @@ def build_target_storylines(records: list[dict[str, Any]], criteria: TargetCrite
                 record = next((item for item in records if item["record_id"] == record_id), None)
                 if record:
                     related[record_id] = record
-        ordered = sorted(related.values(), key=lambda item: item.get("sent_at", ""))
+        ordered = sorted(related.values(), key=lambda item: (_sent_at(item), item["record_id"]))
         all_related.update(related)
         attachment_names = sorted(
             {
-                item.get("filename", "")
+                filename
                 for record in ordered
-                for item in record.get("attachments", [])
-                if any(match.get("target") == target for match in record.get("target_matches", []))
+                for filename in _target_attachment_names(record, target, filename_only)
             }
         )
         events = []
@@ -417,6 +423,7 @@ def build_target_storylines(records: list[dict[str, Any]], criteria: TargetCrite
         }
         previous_by_conversation: dict[int, str] = {}
         seen_event_ids: set[str] = set()
+        edges: list[dict[str, Any]] = []
         for record in ordered:
             parent_id = ""
             link_type = ""
@@ -431,14 +438,55 @@ def build_target_storylines(records: list[dict[str, Any]], criteria: TargetCrite
             if not parent_id and conversation_key in previous_by_conversation:
                 parent_id = previous_by_conversation[conversation_key]
                 link_type = "sequence"
-            events.append(_event(record, target, parent_id, link_type))
+            events.append(_event(record, target, parent_id, link_type, filename_only))
+            if parent_id:
+                saved = decisions.get(EventLinkStore.key(target, parent_id, record["record_id"]), {})
+                decision = saved.get("decision", "pending")
+                if decision not in {"pending", "approved", "rejected"}:
+                    decision = "pending"
+                edges.append({
+                    "from_record_id": parent_id,
+                    "to_record_id": record["record_id"],
+                    "evidence": "reply" if link_type == "reply" else "inferred",
+                    "reason": "In-Reply-To / References 明确指向上一封邮件" if link_type == "reply" else "主题、参与人和时间接近；内容承接仍需人工确认",
+                    "decision": decision,
+                })
             seen_event_ids.add(record["record_id"])
             previous_by_conversation[conversation_key] = record["record_id"]
+        # The latest file-bearing message is the outcome anchor. A later explicit
+        # acknowledgement can become the result, but a mere later date cannot.
+        seed_events = [event for event in events if event["record_id"] in seeds]
+        anchor_id = seed_events[-1]["record_id"] if seed_events else ""
+        result_id = anchor_id
+        event_by_id = {event["record_id"]: event for event in events}
+        descendants = {anchor_id} if anchor_id else set()
+        for edge in edges:
+            if edge["evidence"] != "reply" or edge["from_record_id"] not in descendants:
+                continue
+            child = event_by_id[edge["to_record_id"]]
+            descendants.add(child["record_id"])
+            if _is_confirmation(child, event_by_id[edge["from_record_id"]]) and _sent_at(child) >= _sent_at(event_by_id[anchor_id]):
+                result_id = child["record_id"]
+        chain_ids = {result_id} if result_id else set()
+        while chain_ids:
+            predecessors = {edge["from_record_id"] for edge in edges if edge["decision"] == "approved" and edge["to_record_id"] in chain_ids}
+            new_ids = predecessors - chain_ids
+            if not new_ids:
+                break
+            chain_ids.update(new_ids)
         targets.append(
             {
                 "target": target,
                 "attachment_names": attachment_names,
                 "events": events,
+                "seed_record_ids": sorted(seeds),
+                "anchor_record_id": anchor_id,
+                "result_record_id": result_id,
+                "result_is_confirmation": bool(result_id and result_id != anchor_id),
+                "edges": edges,
+                "confirmed_edges": [edge for edge in edges if edge["decision"] == "approved" and edge["to_record_id"] in chain_ids],
+                "confirmed_record_ids": sorted(chain_ids),
+                "unlinked_record_ids": [event["record_id"] for event in events if event["record_id"] not in chain_ids],
             }
         )
     return {"targets": targets, "matched_messages": len(all_related), "archived_messages": len(records)}
@@ -471,12 +519,8 @@ def _record_target_matches(record: dict[str, Any], filename_matches: dict[str, l
     return result
 
 
-def _event(record: dict[str, Any], target: str, parent_id: str = "", link_type: str = "") -> dict[str, Any]:
-    target_attachments = [
-        item.get("filename", "")
-        for item in record.get("target_matches", [])
-        if item.get("target") == target
-    ]
+def _event(record: dict[str, Any], target: str, parent_id: str = "", link_type: str = "", filename_only: bool = False) -> dict[str, Any]:
+    target_attachments = _target_attachment_names(record, target, filename_only)
     return {
         "record_id": record.get("record_id", ""),
         "sent_at": record.get("sent_at", ""),
@@ -485,6 +529,7 @@ def _event(record: dict[str, Any], target: str, parent_id: str = "", link_type: 
         "cc": record.get("cc", ""),
         "subject": record.get("subject", ""),
         "action": _communication_action(record, target_attachments),
+        "discussion": _discussion_excerpt(str(record.get("body_text", ""))),
         "body_text": record.get("body_text", ""),
         "parent_record_id": parent_id,
         "link_type": link_type,
@@ -495,6 +540,57 @@ def _event(record: dict[str, Any], target: str, parent_id: str = "", link_type: 
         "uid": record.get("uid", ""),
         "eml_path": record.get("eml_path", ""),
     }
+
+
+def _target_attachment_names(record: dict[str, Any], target: str, filename_only: bool = False) -> list[str]:
+    """Use reviewed local filenames directly; retain earlier AI matches as evidence."""
+    keyword = _filename_key(target)
+    ai_names = set() if filename_only else {
+        str(item.get("filename", ""))
+        for item in record.get("target_matches", [])
+        if item.get("target") == target
+    }
+    return list(dict.fromkeys(
+        str(item.get("filename", ""))
+        for item in record.get("attachments", [])
+        if item.get("filename") and (str(item["filename"]) in ai_names or keyword and keyword in _filename_key(str(item["filename"])))
+    ))
+
+
+def _filename_key(value: str) -> str:
+    return "".join(char for char in unicodedata.normalize("NFKC", value).casefold() if char.isalnum())
+
+
+def _discussion_excerpt(body: str) -> str:
+    original = []
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if line.startswith(("发件人:", "From:", "-----Original Message")):
+            break
+        if line and not line.startswith(">"):
+            original.append(line)
+    return " ".join(original[:10])[:500] or "（无可提取的正文；请查看原邮件）"
+
+
+def _sent_at(event: dict[str, Any]) -> datetime:
+    try:
+        value = datetime.fromisoformat(str(event.get("sent_at", "")))
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _is_confirmation(event: dict[str, Any], parent: dict[str, Any]) -> bool:
+    text = event.get("discussion", "").casefold()
+    for request in ("请确认收到", "请确认", "是否同意", "请同意", "待确认", "未确认"):
+        text = text.replace(request, "")
+    affirmative = ("确认收到", "已确认", "确认无误", "确认通过", "同意", "认可", "批准", "无异议", "验收通过", "approved", "confirmed", "agreed")
+    if not any(word in text for word in affirmative) and not re.search(r"(?:^|[。.!！\s])确认(?:[。.!！,，]|$)", text):
+        return False
+    sender = {address.casefold() for _, address in getaddresses([event.get("from", "")])}
+    previous_sender = {address.casefold() for _, address in getaddresses([parent.get("from", "")])}
+    recipients = {address.casefold() for _, address in getaddresses([parent.get("to", ""), parent.get("cc", "")])}
+    return bool(sender and sender != previous_sender and (not recipients or sender & recipients))
 
 
 def _communication_action(record: dict[str, Any], target_attachments: list[str]) -> str:
@@ -530,3 +626,9 @@ def _summary(result: dict[str, Any]) -> dict[str, Any]:
         "cancelled": result.get("cancelled", False),
         "errors": len(result.get("errors", [])),
     }
+
+
+class _FilenameMatcher:
+    """附件名仅按文本匹配，最终取舍由人工审核。"""
+    def match_attachment_names(self, filenames, targets):
+        return {name: [{"target": target, "filename": name, "confidence": 1.0, "reason": "附件名文本命中"} for target in targets if target.casefold() in name.casefold()] for name in filenames}

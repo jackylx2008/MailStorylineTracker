@@ -25,6 +25,18 @@ def _message(sender: str, subject: str, body: str, message_id: str) -> bytes:
     return message.as_bytes()
 
 
+def _attachment_message(subject: str, message_id: str, filename: str) -> bytes:
+    message = EmailMessage()
+    message["From"] = "alice@example.com"
+    message["To"] = "team@example.com"
+    message["Subject"] = subject
+    message["Date"] = "Wed, 23 Sep 2026 10:00:00 +0800"
+    message["Message-ID"] = message_id
+    message.set_content("结果文件请查收。")
+    message.add_attachment(b"example", maintype="application", subtype="pdf", filename=filename)
+    return message.as_bytes()
+
+
 class FakeImapClient:
     messages = {
         "2": _message("news@example.com", "普通新闻", "与项目无关", "<two@example.com>"),
@@ -87,6 +99,50 @@ class DirectDownloadFakeImapClient(PagedFakeImapClient):
 
 
 class MailFlowTests(unittest.TestCase):
+    def test_keyword_analysis_selects_only_related_reviewed_conversations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ctx = AppContext(root, {"app": {"data_dir": "data", "output_dir": "output"}})
+            store = ArchiveStore(ctx.data_dir)
+            examples = [
+                _message("alice@example.com", "项目方案", "先讨论方案。", "<plan@example.com>"),
+                _attachment_message("Re: 项目方案", "<result@example.com>", "风冷热泵_最终.pdf"),
+                _message("bob@example.com", "风冷热泵确认", "已确认。", "<confirm@example.com>"),
+                _message("alice@example.com", "其他项目", "顺便提到风冷热泵，但讨论的是其他项目。", "<other@example.com>"),
+            ]
+            saved_ids = []
+            for index, raw in enumerate(examples, start=1):
+                record = parse_message(raw, account="demo@126.com", mailbox="INBOX", uidvalidity="1", uid=str(index))
+                saved_ids.append(store.save_message(raw, record)["record_id"])
+            store.flush()
+            with patch("mail_storyline_tracker.flows.mail_flow.OpenAICompatibleClient") as client:
+                client.return_value.summarize.return_value = {"matters": []}
+                result = analyze(ctx, final_file_keyword="风冷热泵")
+            groups = client.return_value.summarize.call_args.args[0]
+            self.assertEqual(client.return_value.summarize.call_args.kwargs["focus_keyword"], "风冷热泵")
+            analyzed_ids = {item["record_id"] for group in groups for item in group["messages"]}
+            self.assertEqual(analyzed_ids, set(saved_ids[:3]))
+            self.assertEqual(result["result"]["message_count"], 3)
+            self.assertEqual(result["result"]["reviewed_message_count"], 4)
+            self.assertEqual(result["result"]["attachment_seed_count"], 1)
+            self.assertEqual(result["result"]["final_file_keyword"], "风冷热泵")
+            self.assertIn("本次分析：3/4 封", Path(result["html"]).read_text(encoding="utf-8"))
+
+    def test_keyword_analysis_never_falls_back_to_all_mail_without_attachment_seed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ctx = AppContext(root, {"app": {"data_dir": "data", "output_dir": "output"}})
+            store = ArchiveStore(ctx.data_dir)
+            raw = _message("alice@example.com", "风冷热泵确认", "已确认。", "<confirm@example.com>")
+            record = parse_message(raw, account="demo@126.com", mailbox="INBOX", uidvalidity="1", uid="1")
+            store.save_message(raw, record)
+            store.flush()
+            with patch("mail_storyline_tracker.flows.mail_flow.OpenAICompatibleClient") as client:
+                with self.assertRaisesRegex(RuntimeError, "未执行全量分析"):
+                    analyze(ctx, final_file_keyword="风冷热泵")
+                client.assert_not_called()
+            self.assertFalse((ctx.output_dir / "storyline.json").exists())
+
     def test_user_cancel_is_clean_and_keeps_download_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

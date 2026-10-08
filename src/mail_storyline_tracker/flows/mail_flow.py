@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import unicodedata
 from collections.abc import Callable, Mapping
 from concurrent.futures import CancelledError
 from datetime import datetime, timezone
@@ -243,24 +244,11 @@ def _scan(ctx: AppContext, overrides: Mapping[str, Any] | None, *, save: bool, p
 
 
 def check_ai(ctx: AppContext) -> dict[str, Any]:
-    return OpenAICompatibleClient(AISettings.from_config(ctx.config)).check()
+    raise RuntimeError("本项目已停止 AI 服务及时间线工作")
 
 
-def analyze(ctx: AppContext) -> dict[str, Any]:
-    store = ArchiveStore(ctx.data_dir)
-    records = store.reviewed_records()
-    if not records:
-        raise RuntimeError("尚无可分析邮件，请检查下载归档与人工审核排除结果")
-    conversations = group_conversations(records)
-    result = OpenAICompatibleClient(AISettings.from_config(ctx.config)).summarize(conversations)
-    result["generated_at"] = datetime.now(timezone.utc).isoformat()
-    result["conversation_count"] = len(conversations)
-    result["message_count"] = len(records)
-    output_json = ctx.output_dir / "storyline.json"
-    output_json.parent.mkdir(parents=True, exist_ok=True)
-    output_json.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    output_html = write_storyline_report(result, ctx.output_dir / "storyline.html")
-    return {"result": result, "json": str(output_json), "html": str(output_html)}
+def analyze(ctx: AppContext, progress: Progress | None = None, final_file_keyword: str | None = None) -> dict[str, Any]:
+    raise RuntimeError("本项目已停止 AI 分析；请下载邮件后进行人工审核")
 
 
 def _mask(value: str) -> str:

@@ -45,12 +45,13 @@ def write_mail_review(records: list[dict[str, Any]], path: Path) -> Path:
 
 
 REVIEW_STYLE = """
+[hidden]{display:none!important}
 .review-toolbar{display:grid;grid-template-columns:repeat(2,minmax(220px,1fr));gap:12px}
 .review-toolbar label{display:block;font-size:13px;color:var(--muted);font-weight:600}
 .review-toolbar input{display:block;margin-top:4px}.review-summary{grid-column:1/-1;color:var(--muted);font-size:13px}
 .review-actions{display:flex;justify-content:flex-end;margin-top:14px;padding-top:10px;border-top:1px solid var(--line)}
-.delete-review,#undo-delete{padding:6px 11px;border:1px solid #b8c3d3;border-radius:7px;background:#fff;color:#9b302b;cursor:pointer;font:inherit}
-.delete-review:hover,#undo-delete:hover{background:#fff0ee}#undo-delete{color:var(--ink);margin-left:8px}
+.delete-review,#undo-delete,#save-review{padding:6px 11px;border:1px solid #b8c3d3;border-radius:7px;background:#fff;color:#9b302b;cursor:pointer;font:inherit}
+.delete-review:hover,#undo-delete:hover,#save-review:hover{background:#fff0ee}#undo-delete{color:var(--ink);margin-left:8px}#save-review{background:#2857c5;color:white;border-color:#2857c5;margin-right:8px}
 pre{white-space:pre-wrap;overflow-wrap:anywhere}code{overflow-wrap:anywhere}.empty-review{padding:18px;color:var(--muted)}
 @media(max-width:640px){.review-toolbar{grid-template-columns:1fr}}
 """
@@ -62,21 +63,55 @@ const emailFilter=document.getElementById('email-filter');
 const keywordFilter=document.getElementById('keyword-filter');
 const summary=document.getElementById('review-summary');
 const syncStatus=document.getElementById('review-sync-status');
+const reviewLink=document.getElementById('review-open-link');
 const empty=document.getElementById('empty-review');
 const undo=document.getElementById('undo-delete');
-const apiUrl=new URLSearchParams(location.search).get('review_api');
+const saveButton=document.getElementById('save-review');
+const reviewParams=new URLSearchParams(location.search);
+const pageToken=reviewParams.get('token');
+const apiUrl=location.protocol==='http:'&&location.hostname==='127.0.0.1'&&location.pathname==='/page'&&pageToken
+  ? `/review?token=${encodeURIComponent(pageToken)}` : reviewParams.get('review_api');
 const storageKey='mail-storyline-review-deleted-v1:'+location.pathname;
 let storageAvailable=true;
 let deleted;
 try{deleted=new Set(JSON.parse(localStorage.getItem(storageKey)||'[]'));}
 catch(error){deleted=new Set();storageAvailable=false;}
+const pendingKey=storageKey+':pending';
+let pending=new Map();
+try{pending=new Map(JSON.parse(localStorage.getItem(pendingKey)||'[]'));}catch(error){}
+if(location.protocol==='file:')deleted.forEach(id=>{if(!pending.has(id))pending.set(id,{excluded:true});});
+if(location.hash.startsWith('#legacy=')){
+  try{
+    const legacy=JSON.parse(decodeURIComponent(location.hash.slice(8)));
+    const ids=Array.isArray(legacy)?legacy:legacy.deleted;
+    if(Array.isArray(ids))ids.filter(id=>typeof id==='string').forEach(id=>{deleted.add(id);pending.set(id,{excluded:true});});
+    if(Array.isArray(legacy.pending))legacy.pending.forEach(([id,decision])=>pending.set(id,decision));
+  }catch(error){/* 旧版浏览器状态损坏时不影响新审核页 */}
+  history.replaceState(null,'',location.pathname+location.search);
+}
+const reviewPage=reviewParams.get('review_page');
+if(reviewPage&&location.protocol==='file:'){
+  try{
+    const destination=new URL(reviewPage);
+    if(destination.protocol==='http:'&&destination.hostname==='127.0.0.1'&&destination.pathname==='/page'){
+      destination.hash=`legacy=${encodeURIComponent(JSON.stringify({deleted:[...deleted],pending:[...pending]}))}`;
+      reviewLink.href=destination.href;
+      reviewLink.hidden=false;
+      location.replace(destination.href);
+    }
+  }catch(error){/* 下方提示从 GUI 重新打开 */}
+}
 let lastDeleted='';
-let apiReady=false;
+let saving=false;
+let saveVersion=0;
 const terms=value=>value.toLocaleLowerCase().split(/[,，;；]+/).map(x=>x.trim()).filter(Boolean);
 const matches=(text,values)=>!values.length||values.some(value=>text.toLocaleLowerCase().includes(value));
 function saveDeleted(){
   if(!storageAvailable)return;
-  try{localStorage.setItem(storageKey,JSON.stringify([...deleted]));}
+  try{
+    localStorage.setItem(storageKey,JSON.stringify([...deleted]));
+    localStorage.setItem(pendingKey,JSON.stringify([...pending]));
+  }
   catch(error){storageAvailable=false;}
 }
 function update(){
@@ -89,45 +124,77 @@ function update(){
   });
   summary.textContent=`显示 ${shown} / ${cards.length} 封 · 已排除 ${deleted.size} 封`;
   empty.hidden=shown!==0;
-  undo.hidden=!lastDeleted||!apiReady;
+  undo.hidden=!lastDeleted;
+  saveButton.disabled=saving||pending.size===0;
 }
-async function sendDecision(action,recordIds){
-  const response=await fetch(apiUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,record_ids:recordIds})});
-  const result=await response.json();
-  if(!response.ok)throw new Error(result.error||'审核状态保存失败');
-  deleted=new Set(result.excluded_record_ids);
-  saveDeleted();update();
-  return result;
-}
-document.querySelectorAll('.delete-review').forEach(button=>button.addEventListener('click',async()=>{
-  const card=button.closest('.review-item');
-  button.disabled=true;
+async function requestReview(method,body){
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),15000);
   try{
-    const result=await sendDecision('exclude',[card.dataset.recordId]);
-    lastDeleted=card.dataset.recordId;
-    syncStatus.textContent=result.report_error?'排除已保存，但故事线重建失败；请重新生成报告。':'审核决定已保存到本地项目，后续故事线将跳过该邮件。';
-    update();
-  }catch(error){syncStatus.textContent=`保存失败：${error.message}`;}
-  finally{button.disabled=false;}
+    const options={method,signal:controller.signal};
+    if(body){options.headers={'Content-Type':'application/json'};options.body=JSON.stringify(body);}
+    const response=await fetch(apiUrl,options);
+    const result=await response.json();
+    if(!response.ok)throw new Error(result.error||'审核状态保存失败');
+    if(!Array.isArray(result.excluded_record_ids))throw new Error('审核接口返回格式不正确');
+    return result;
+  }finally{clearTimeout(timeout);}
+}
+function applyResult(result){
+  deleted=new Set(result.excluded_record_ids);
+  pending.forEach((decision,id)=>decision.excluded?deleted.add(id):deleted.delete(id));
+  saveDeleted();update();
+}
+async function saveDecisions(){
+  if(saving||!pending.size)return;
+  if(!apiUrl){
+    syncStatus.textContent=storageAvailable?'请从 GUI 的“导入旧版浏览器审核记录”打开页面，再点击保存审核结果。':'浏览器无法暂存，请从 GUI 打开审核页后重新审核。';
+    return;
+  }
+  const batch=[...pending];
+  saving=true;
+  saveVersion++;
+  update();
+  syncStatus.textContent=`正在保存 ${batch.length} 项审核决定…`;
+  try{
+    const exclude_ids=batch.filter(([,decision])=>decision.excluded).map(([id])=>id);
+    const restore_ids=batch.filter(([,decision])=>!decision.excluded).map(([id])=>id);
+    const result=await requestReview('POST',{action:'save',exclude_ids,restore_ids});
+    batch.forEach(([id,decision])=>{if(pending.get(id)===decision)pending.delete(id);});
+    applyResult(result);
+    syncStatus.textContent=pending.size?`已保存 ${batch.length} 项；另有 ${pending.size} 项待保存。`:result.report_error?'审核记录已保存，但报告重建失败；请重新生成报告。':`已保存 ${batch.length} 项审核决定，项目共排除 ${deleted.size} 封邮件。`;
+  }catch(error){
+    syncStatus.textContent=`保存失败：${error.message}。${storageAvailable?'待保存操作仍在当前浏览器中。':'请勿关闭本页。'}请保持 GUI 运行后再点击“保存审核结果”。`;
+  }finally{saving=false;update();}
+}
+function decide(id,excluded){
+  if(excluded)deleted.add(id);else deleted.delete(id);
+  pending.set(id,{excluded});
+  saveDeleted();update();
+  syncStatus.textContent=`有 ${pending.size} 项审核决定待保存，请点击“保存审核结果”。`;
+}
+document.querySelectorAll('.delete-review').forEach(button=>button.addEventListener('click',()=>{
+  lastDeleted=button.closest('.review-item').dataset.recordId;
+  decide(lastDeleted,true);
 }));
-undo.addEventListener('click',async()=>{
-  undo.disabled=true;
-  try{const result=await sendDecision('restore',[lastDeleted]);lastDeleted='';syncStatus.textContent=result.report_error?'恢复已保存，但故事线重建失败；请重新生成报告。':'已恢复审核条目及后续故事线。';update();}
-  catch(error){syncStatus.textContent=`恢复失败：${error.message}`;}
-  finally{undo.disabled=false;}
+undo.addEventListener('click',()=>{
+  if(!lastDeleted)return;
+  const id=lastDeleted;
+  lastDeleted='';
+  decide(id,false);
 });
+saveButton.addEventListener('click',()=>void saveDecisions());
 emailFilter.addEventListener('input',update);
 keywordFilter.addEventListener('input',update);
-document.querySelectorAll('.delete-review').forEach(button=>button.disabled=true);
 update();
 if(apiUrl){
-  sendDecision('merge',[...deleted]).then(result=>{
-    apiReady=true;
-    document.querySelectorAll('.delete-review').forEach(button=>button.disabled=false);
-    syncStatus.textContent=result.report_error?'审核决定已同步，但故事线重建失败；请重新生成报告。':`审核决定已与本地项目同步，共排除 ${deleted.size} 封邮件。`;
-    update();
-  }).catch(error=>{syncStatus.textContent=`审核状态同步失败：${error.message}；请从 GUI 重新打开审核页。`;});
-}else{syncStatus.textContent='请从项目 GUI 打开审核页，才能将删除决定同步到后续故事线。';}
+  const version=saveVersion;
+  requestReview('GET').then(result=>{
+    if(saveVersion!==version)return;
+    applyResult(result);
+    syncStatus.textContent=pending.size?`有 ${pending.size} 项审核决定待保存，请点击“保存审核结果”。`:'审核记录已从本地项目读取。';
+  }).catch(error=>{syncStatus.textContent=`读取项目审核记录失败：${error.message}。可继续审核，保存时重试。`;});
+}else{syncStatus.textContent=pending.size?`有 ${pending.size} 项待保存，请从 GUI 导入旧版浏览器审核记录。`:'删除会暂存在此浏览器；请从 GUI 导入后统一保存。';}
 """
 
 
@@ -139,7 +206,7 @@ def _write_review_page(path: Path, count: int, cards: str) -> Path:
     <main><div class="toolbar review-toolbar">
     <label>邮箱筛选（From / To / Cc）<input id="email-filter" type="search" placeholder="输入邮箱地址或片段；多个值用逗号分隔"></label>
     <label>关键词筛选（主题 / 正文 / 附件名）<input id="keyword-filter" type="search" placeholder="输入关键词；多个值用逗号分隔"></label>
-    <div class="review-summary"><span id="review-summary"></span><button type="button" id="undo-delete" hidden>撤销上次删除</button><br><span id="review-sync-status" role="status"></span><br>删除条目会写入本地审核排除记录，后续故事线不再包含该邮件；原始邮件、附件和服务器邮件仍保留。</div>
+    <div class="review-summary"><button type="button" id="save-review">保存审核结果</button><button type="button" id="undo-delete" hidden>撤销上次删除</button><span id="review-summary"></span><br><span id="review-sync-status" role="status" aria-live="polite"></span><br><a id="review-open-link" hidden>如果没有自动跳转，点击这里打开可操作的审核页</a><br>点击删除后条目立即移除；点击“保存审核结果”后删除所选邮件的本地原文及附件；保存前可以撤销，保存后无法恢复。其余邮件保留。</div>
     </div>{cards}<div id="empty-review" class="card empty-review" hidden>没有符合当前筛选条件的邮件。</div></main>
     <script>{REVIEW_SCRIPT}</script></body></html>'''
     path.write_text(document, encoding="utf-8")
@@ -168,7 +235,14 @@ def write_storyline_report(result: dict[str, Any], path: Path) -> Path:
             <h3>已完成</h3>{completed}<h3>待办 / 责任人 / 截止日期</h3><ul>{todos}</ul>
             <h3>风险</h3>{risks}<h3>时间线</h3><div class="timeline">{events or "无时间线"}</div></article>'''
         )
-    return _write_page(path, "工作事项时间线", f"模型：{result.get('model', '')} · 事项数：{len(result.get('matters', []))}", "".join(cards))
+    subtitle = f"模型：{result.get('model', '')} · 事项数：{len(result.get('matters', []))}"
+    if result.get("final_file_keyword"):
+        subtitle += (
+            f" · 最终文件关键词：{result['final_file_keyword']}"
+            f" · 附件起点：{result.get('attachment_seed_count', 0)} 封"
+            f" · 本次分析：{result.get('message_count', 0)}/{result.get('reviewed_message_count', 0)} 封"
+        )
+    return _write_page(path, "工作事项时间线", subtitle, "".join(cards))
 
 
 def write_target_mindmap(result: dict[str, Any], path: Path) -> Path:

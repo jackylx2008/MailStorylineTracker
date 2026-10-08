@@ -1,22 +1,4 @@
-"""邮件事项时间线命令行工具
-
-用途：
-  检查 126.com IMAP 与 AI 服务、预览筛选结果、增量下载邮件，并生成工作事项时间线。
-
-配置文件：
-  默认读取根目录 config.yaml；真实邮箱、授权码及 AI API Key 写入不受 Git 跟踪的 .env。
-
-示例：
-  python mail_storyline.py check-mail
-  python mail_storyline.py list-folders
-  python mail_storyline.py preview --senders example.com --keywords 项目,合同
-  python mail_storyline.py download
-  python mail_storyline.py target-scan
-  python mail_storyline.py analyze
-
-输出：
-  原始邮件和 JSON 状态写入 data/，审核、目标附件沟通链路与时间线页面写入 output/，日志写入 logs/。
-"""
+"""有关邮件下载与人工审核命令行工具。服务器只读，本地审核删除原文及附件。"""
 
 from __future__ import annotations
 
@@ -44,7 +26,7 @@ def parse_args() -> argparse.Namespace:
         "action",
         choices=(
             "check-login", "check-mail", "list-folders", "preview", "download", "target-scan",
-            "target-local-classify", "target-report", "check-ai", "analyze", "all",
+            "review", "purge-reviewed",
         ),
     )
     parser.add_argument("--config", default="config.yaml")
@@ -91,16 +73,12 @@ def main() -> int:
         result = download(ctx, overrides)
     elif args.action == "target-scan":
         result = scan_targets(ctx, overrides=overrides)
-    elif args.action == "target-local-classify":
-        result = classify_local_archive(ctx)
-    elif args.action == "target-report":
-        result = generate_target_report(ctx, TargetCriteria.load(PROJECT_ROOT), {"incomplete": True, "stop_reason": "仅使用当前本地增量数据生成"})
-    elif args.action == "check-ai":
-        result = check_ai(ctx)
-    elif args.action == "analyze":
-        result = analyze(ctx)
     else:
-        result = {"target_scan": scan_targets(ctx), "analysis": analyze(ctx)}
+        from mail_storyline_tracker.modules.storage import ArchiveStore
+        from mail_storyline_tracker.modules.html_report import write_mail_review
+        store = ArchiveStore(ctx.data_dir)
+        removed = store.delete_excluded_content() if args.action == "purge-reviewed" else 0
+        result = {"deleted": removed, "retained": len(store.reviewed_records()), "html": str(write_mail_review(store.reviewed_records(), ctx.output_dir / "mail_review.html"))}
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 

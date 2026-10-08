@@ -6,6 +6,8 @@ import unittest
 from concurrent.futures import CancelledError
 from email.message import EmailMessage
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 from unittest.mock import patch
 
 from mail_storyline_tracker.config import AppContext
@@ -16,6 +18,8 @@ from mail_storyline_tracker.modules.storage import ArchiveStore
 from mail_storyline_tracker.modules.target_config import TargetCriteria
 from mail_storyline_tracker.flows.target_flow import _process_batch, build_target_storylines, generate_target_report, scan_targets
 from mail_storyline_tracker.modules.imap_client import MailboxInfo
+from mail_storyline_tracker.modules.event_links import EventLinkStore
+from mail_storyline_tracker.modules.review_service import ReviewService
 
 
 def _record(record_id: str, message_id: str, subject: str, sent_at: str, *, target: str = "", reference: str = "") -> dict:
@@ -148,8 +152,7 @@ class TargetFlowTests(unittest.TestCase):
             ctx = AppContext(root, {"app": {"data_dir": "data", "output_dir": "output"}})
             store = ArchiveStore(ctx.data_dir)
             record = parse_message(raw, account="demo@126.com", mailbox="INBOX", uidvalidity="1", uid="8")
-            criteria = TargetCriteria((), (), ("示例审核资料",))
-            record["target_matches"] = [{"target": "示例审核资料", "filename": "review.pdf"}]
+            criteria = TargetCriteria((), (), ("review",))
             stored = store.save_message(raw, record)
             store.flush()
             generate_target_report(ctx, criteria)
@@ -159,6 +162,22 @@ class TargetFlowTests(unittest.TestCase):
             generate_target_report(ctx, criteria)
             after = json.loads((ctx.output_dir / "target_storylines.json").read_text(encoding="utf-8"))
             self.assertEqual(after["targets"][0]["events"], [])
+
+    def test_manual_filename_keyword_starts_backward_trace_without_ai_match(self) -> None:
+        record = _record("file", "<file@example.com>", "最终文件", "2026-09-01T08:00:00+08:00")
+        record["attachments"] = [{"filename": "项目_设备品牌推荐表-V2.pdf"}]
+        earlier = _record("earlier", "<earlier@example.com>", "Re: 最终文件", "2026-08-31T08:00:00+08:00")
+        earlier["references"] = ["<file@example.com>"]
+        criteria = TargetCriteria((), (), ("设备品牌推荐表",))
+        result = build_target_storylines([record, earlier], criteria, filename_only=True)
+        topic = result["targets"][0]
+        self.assertEqual(topic["seed_record_ids"], ["file"])
+        self.assertIn("项目_设备品牌推荐表-V2.pdf", topic["attachment_names"])
+        self.assertEqual(topic["anchor_record_id"], "file")
+        self.assertEqual(len(topic["events"]), 2)
+        ai_only = _record("ai", "<ai@example.com>", "无关主题", "2026-09-02T08:00:00+08:00", target="设备品牌推荐表")
+        ai_only["attachments"] = [{"filename": "unrelated.pdf"}]
+        self.assertEqual(build_target_storylines([ai_only], criteria, filename_only=True)["targets"][0]["events"], [])
 
     def test_matched_target_downloads_full_eml_and_attachment_once(self) -> None:
         message = EmailMessage()
@@ -243,6 +262,12 @@ class TargetFlowTests(unittest.TestCase):
         self.assertEqual(second["parent_record_id"], first["record_id"])
         self.assertEqual(second["link_type"], "reply")
         self.assertEqual(second["body_text"], "请审核并回复。")
+        topic = result["targets"][0]
+        self.assertEqual(topic["anchor_record_id"], first["record_id"])
+        self.assertEqual(topic["result_record_id"], first["record_id"])
+        self.assertEqual(topic["edges"][0]["evidence"], "reply")
+        self.assertEqual(topic["edges"][0]["decision"], "pending")
+        self.assertEqual(topic["confirmed_record_ids"], [first["record_id"]])
         with tempfile.TemporaryDirectory() as directory:
             path = write_target_mindmap(
                 {
@@ -256,12 +281,69 @@ class TargetFlowTests(unittest.TestCase):
             content = path.read_text(encoding="utf-8")
             self.assertIn("附件往来沟通链路", content)
             self.assertIn("示例审核意见", content)
-            self.assertIn("折叠全部", content)
+            self.assertIn("独立事项", content)
             self.assertIn("部分扫描结果", content)
             self.assertIn("测试限流", content)
             self.assertIn("graph-scroll", content)
             self.assertIn("showModal()", content)
             self.assertIn("邮件正文", content)
+
+    def test_confirmation_endpoint_and_human_link_decision(self) -> None:
+        target = "示例审核意见"
+        sent = _record("sent", "<sent@example.com>", target, "2026-09-01T08:00:00+08:00", target=target)
+        reply = _record("reply", "<reply@example.com>", "Re: " + target, "2026-09-02T08:00:00+08:00", reference="<sent@example.com>")
+        reply["body_text"] = "确认收到并同意。"
+        reply["from"] = "Team <team@example.com>"
+        unrelated = _record("other", "<other@example.com>", "完全无关", "2026-09-03T08:00:00+08:00")
+        criteria = TargetCriteria((), (), (target,))
+        report = build_target_storylines([sent, reply, unrelated], criteria)
+        item = report["targets"][0]
+        self.assertEqual(item["result_record_id"], "reply")
+        self.assertTrue(item["result_is_confirmation"])
+        self.assertEqual(item["confirmed_record_ids"], ["reply"])
+        self.assertNotIn("other", [event["record_id"] for event in item["events"]])
+        with tempfile.TemporaryDirectory() as directory:
+            store = EventLinkStore(Path(directory))
+            store.save(target, "sent", "reply", "approved")
+            approved = build_target_storylines([sent, reply, unrelated], criteria, store.decisions())["targets"][0]
+            self.assertEqual(approved["confirmed_record_ids"], ["reply", "sent"])
+            store.save(target, "sent", "reply", "rejected")
+            rejected = build_target_storylines([sent, reply, unrelated], criteria, store.decisions())["targets"][0]
+            self.assertEqual(rejected["confirmed_record_ids"], ["reply"])
+
+        reply["body_text"] = "请确认收到后回复。"
+        pending = build_target_storylines([sent, reply], criteria)["targets"][0]
+        self.assertEqual(pending["result_record_id"], "sent")
+
+    def test_event_link_service_validates_and_persists_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "target_storylines.html"
+            path.write_text("<html></html>", encoding="utf-8")
+            path.with_suffix(".json").write_text(json.dumps({"targets": [{"target": "事项", "edges": [
+                {"from_record_id": "one", "to_record_id": "two"}
+            ]}]}, ensure_ascii=False), encoding="utf-8")
+            rebuilt = []
+            service = ReviewService(root / "data", lambda: rebuilt.append(True), storyline_path=path)
+            try:
+                with urlopen(service.storyline_url, timeout=5) as response:
+                    self.assertIn(b"html", response.read())
+
+                def post(source: str) -> int:
+                    request = Request(service.event_link_url, data=json.dumps({
+                        "target": "事项", "from_record_id": source,
+                        "to_record_id": "two", "decision": "approved",
+                    }).encode(), headers={"Content-Type": "application/json"})
+                    with urlopen(request, timeout=5) as response:
+                        return response.status
+                with self.assertRaises(HTTPError) as invalid:
+                    post("unknown")
+                self.assertEqual(invalid.exception.code, 400)
+                self.assertEqual(post("one"), 200)
+                self.assertEqual(len(rebuilt), 1)
+                self.assertEqual(EventLinkStore(root / "data").decisions()[EventLinkStore.key("事项", "one", "two")]["decision"], "approved")
+            finally:
+                service.close()
 
 
 if __name__ == "__main__":
